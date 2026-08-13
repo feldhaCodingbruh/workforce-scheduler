@@ -1,76 +1,152 @@
-from flask import Flask, render_template, request, redirect, url_for
+﻿
 import calendar
+from datetime import datetime
+from io import BytesIO
+import json
+import os
 import re
+import unicodedata
+import urllib.error
+import urllib.request
+from copy import deepcopy
+from pathlib import Path
+from uuid import uuid4
+
+from flask import Flask, abort, redirect, render_template, request, send_file, url_for
+from openpyxl import Workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
 app = Flask(__name__)
 
-workers = []
-generated_schedule = []
+DATA_FILE = Path(__file__).with_name("scheduler_data.json")
+EXPORTS_DIR = Path(__file__).with_name("exports")
+DEFAULT_MONTH = 3
+DEFAULT_YEAR = 2026
+DEFAULT_FULL_TIME_HOURS = 160
+RULES_VERSION = 5
+BUILD_NUMBER = "0.4.4"
+DEFAULT_AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
+FULL_SHIFT_MIN_HOURS = 7.0
+HALF_SHIFT_HOURS = 4.0
+MIN_SHORT_SHIFT_MINUTES = 270
+MIN_REST_HOURS = 11
+MAX_CONSECUTIVE_DAYS = 5
 
-schedule_settings = {
-    "month": 3,
-    "year": 2026,
-    "weekday_shifts": [
-        {"label": "Pamaina 1", "start": "10:00", "end": "18:30"},
-        {"label": "Pamaina 2", "start": "13:00", "end": "21:30"},
-    ],
-    "weekend_shifts": [
-        {"label": "Pamaina 1", "start": "10:00", "end": "18:30"},
-        {"label": "Pamaina 2", "start": "13:00", "end": "21:30"},
-        {"label": "Pamaina 3", "start": "15:00", "end": "21:30"},
-    ]
+LOCATION_CONFIGS = [
+    {"id": "location-a", "name": "Location A"},
+    {"id": "location-b", "name": "Location B"},
+    {"id": "location-c", "name": "Location C"},
+    {"id": "location-d", "name": "Location D"},
+    {"id": "location-e", "name": "Location E"},
+    {"id": "location-f", "name": "Location F"},
+    {"id": "location-g", "name": "Location G"},
+    {"id": "location-h", "name": "Location H"},
+    {"id": "location-i", "name": "Location I"},
+]
+DEFAULT_LOCATION_ID = LOCATION_CONFIGS[0]["id"]
+DAY_SHORT_NAMES = ["Pr", "An", "Tr", "Kt", "Pn", "St", "Sk"]
+DAY_LONG_NAMES = [
+    "Pirmadienis", "Antradienis", "Treciadienis", "Ketvirtadienis",
+    "Penktadienis", "Sestadienis", "Sekmadienis",
+]
+MONTH_NAMES = {
+    1: "Sausis", 2: "Vasaris", 3: "Kovas", 4: "Balandis", 5: "Geguze", 6: "Birzelis",
+    7: "Liepa", 8: "Rugpjutis", 9: "Rugsejis", 10: "Spalis", 11: "Lapkritis", 12: "Gruodis",
 }
 
 
-def parse_availability_lines(raw_text):
-    return [line.strip() for line in raw_text.splitlines() if line.strip()]
+def build_shift(start, end, hours, label):
+    return {"label": label, "start": start, "end": end, "hours": float(hours)}
 
 
-def get_days_in_month(year, month):
-    return calendar.monthrange(year, month)[1]
+def build_day_rules(shift_specs, breaks=None):
+    return {
+        "shifts": [build_shift(start, end, hours, f"Pamaina {index}") for index, (start, end, hours) in enumerate(shift_specs, start=1)],
+        "breaks": list(breaks or []),
+    }
 
 
-def get_worker_status(day_count, expected_days):
-    if day_count == expected_days:
-        return "Gerai"
-    elif day_count < expected_days:
-        return f"Trūksta {expected_days - day_count} d."
-    return f"Per daug: +{day_count - expected_days} d."
+DEFAULT_LOCATION_RULE = {
+    "name": "Bazinis sablonas",
+    "notes": ["Hard-coded taisykles.", "Grafikas remiasi dienos poreikiu."],
+    "days": [
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8), ("15:00", "21:30", 6)], ["13:30-14:00", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8), ("15:00", "21:30", 6)], ["13:30-14:00", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8), ("15:00", "21:30", 6)], ["13:30-14:00", "16:30-17:00", "17:00-17:30"]),
+    ],
+}
+
+LOCATION_RULES = {
+    "location-a": {"name": "Location A", "notes": ["Sample three-shift template"], "days": [
+        build_day_rules([("09:00", "17:30", 8), ("13:00", "21:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("09:00", "17:30", 8), ("13:00", "21:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("09:00", "17:30", 8), ("13:00", "21:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("09:00", "17:30", 8), ("13:00", "21:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("09:00", "17:30", 8), ("13:00", "21:30", 8), ("13:00", "21:30", 8), ("15:00", "21:30", 6)], ["13:00-13:30", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("09:00", "17:30", 8), ("12:00", "20:30", 8), ("13:00", "21:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "16:00-16:30", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("09:00", "17:30", 8), ("12:00", "20:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "16:00-16:30", "16:30-17:00"]),
+    ]},
+    "location-b": {"name": "Location B", "notes": ["Sample mixed-hours template"], "days": [
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "17:00-17:30"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "17:00-17:30"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "17:00-17:30"]),
+        build_day_rules([("10:00", "17:30", 7), ("14:00", "22:30", 8)], ["13:00-13:30", "16:30-17:00"]),
+        build_day_rules([("10:00", "18:30", 8), ("14:00", "22:30", 8), ("18:30", "22:30", 4)], ["14:00-14:30", "17:30-18:00", "18:00-18:30"]),
+        build_day_rules([("10:00", "18:30", 8), ("14:00", "22:30", 8), ("14:00", "22:30", 8)], ["14:00-14:30", "17:30-18:00", "18:00-18:30"]),
+        build_day_rules([("10:00", "18:30", 8), ("13:00", "21:30", 8), ("13:00", "21:30", 8)], ["13:00-13:30", "16:30-17:00", "17:30-18:00"]),
+    ]},
+    "location-c": {"name": "Location C", "notes": ["Sample two-shift template"], "days": [
+        build_day_rules([("10:00", "17:30", 7), ("13:00", "21:30", 8), ("14:00", "21:30", 7)], ["13:30-14:00", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("10:00", "17:30", 7), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "17:30", 7), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "17:30", 7), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "17:30", 7), ("13:00", "21:30", 8), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00", "17:00-17:30"]),
+        build_day_rules([("10:00", "17:30", 7), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+        build_day_rules([("10:00", "17:30", 7), ("13:00", "21:30", 8)], ["13:30-14:00", "16:30-17:00"]),
+    ]},
+    "location-d": {"name": "Location D", "notes": ["Sample base template"], "days": DEFAULT_LOCATION_RULE["days"]},
+    "location-e": {"name": "Location E", "notes": ["Sample base template"], "days": DEFAULT_LOCATION_RULE["days"]},
+    "location-f": {"name": "Location F", "notes": ["Sample base template"], "days": DEFAULT_LOCATION_RULE["days"]},
+    "location-g": DEFAULT_LOCATION_RULE,
+    "location-h": DEFAULT_LOCATION_RULE,
+    "location-i": DEFAULT_LOCATION_RULE,
+}
 
 
 def normalize_text(text):
-    text = text.strip().lower()
-
-    replacements = {
-        "ė": "e",
-        "ū": "u",
-        "ų": "u",
-        "į": "i",
-        "š": "s",
-        "ž": "z",
-        "ą": "a",
-        "č": "c",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    return text
+    normalized = unicodedata.normalize("NFKD", str(text or "").strip().lower())
+    return "".join(character for character in normalized if not unicodedata.combining(character))
 
 
-def extract_time(text):
-    match = re.search(r'(\d{1,2})(?::(\d{2}))?', text)
+def safe_float(value, default=0.0):
+    try:
+        return float(str(value).replace(",", "."))
+    except (TypeError, ValueError):
+        return default
 
+
+def sanitize_int(value, default, minimum, maximum):
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if minimum <= parsed <= maximum else default
+
+
+def is_valid_time(time_str):
+    if not isinstance(time_str, str):
+        return False
+    match = re.fullmatch(r"(\d{2}):(\d{2})", time_str.strip())
     if not match:
-        return None
-
+        return False
     hour = int(match.group(1))
-    minute = int(match.group(2)) if match.group(2) else 0
-
-    if 0 <= hour <= 23 and 0 <= minute <= 59:
-        return f"{hour:02d}:{minute:02d}"
-
-    return None
+    minute = int(match.group(2))
+    return 0 <= hour <= 23 and 0 <= minute <= 59
 
 
 def time_to_minutes(time_str):
@@ -79,296 +155,627 @@ def time_to_minutes(time_str):
 
 
 def minutes_to_time(minutes):
-    hour = minutes // 60
-    minute = minutes % 60
-    return f"{hour:02d}:{minute:02d}"
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 def shift_length_hours(start, end):
-    start_m = time_to_minutes(start)
-    end_m = time_to_minutes(end)
-    return (end_m - start_m) / 60
+    return (time_to_minutes(end) - time_to_minutes(start)) / 60
 
 
-def can_cover_shift(available_start, available_end, shift_start, shift_end):
-    return available_start <= shift_start and available_end >= shift_end
+def etatas_to_month_hours(etatas, full_time_hours=DEFAULT_FULL_TIME_HOURS):
+    return safe_float(etatas) * full_time_hours
 
 
-def etatas_to_month_hours(etatas):
-    # paprastas pirmas variantas
-    # 1.0 etatas ≈ 160 val./mėn.
-    return float(etatas) * 160
+def get_days_in_month(year, month):
+    return calendar.monthrange(year, month)[1]
+
+
+def get_day_type(year, month, day):
+    weekday_index = calendar.weekday(year, month, day)
+    return ("weekend", weekday_index) if weekday_index >= 5 else ("weekday", weekday_index)
+
+
+def weekday_name_from_index(index):
+    return DAY_SHORT_NAMES[index]
+
+
+def format_demand_value(value):
+    rounded = round(value * 2) / 2
+    return str(int(round(rounded))) if abs(rounded - round(rounded)) < 0.001 else str(rounded).replace(".", ",")
+
+
+def sanitize_demand_value(value, default):
+    parsed = safe_float(value, default)
+    return round(max(0.0, min(parsed, 5.0)) * 2) / 2
+
+
+def get_location_rule(location_id):
+    return LOCATION_RULES.get(location_id, DEFAULT_LOCATION_RULE)
+
+
+def get_day_rules_for_weekday(location_id, weekday_index):
+    return deepcopy(get_location_rule(location_id)["days"][weekday_index])
+
+
+def split_template_shifts(day_rules):
+    full_shifts, half_shifts = [], []
+    for shift in day_rules["shifts"]:
+        copied = deepcopy(shift)
+        if copied["hours"] >= FULL_SHIFT_MIN_HOURS:
+            full_shifts.append(copied)
+        else:
+            half_shifts.append(copied)
+    if not full_shifts and day_rules["shifts"]:
+        full_shifts = [deepcopy(item) for item in sorted(day_rules["shifts"], key=lambda item: (-item["hours"], item["start"]))]
+    if not half_shifts and full_shifts:
+        source_shift = max(full_shifts, key=lambda item: time_to_minutes(item["end"]))
+        end_minutes = time_to_minutes(source_shift["end"])
+        start_minutes = max(time_to_minutes(source_shift["start"]), end_minutes - int(HALF_SHIFT_HOURS * 60))
+        half_shifts.append({"label": "Puse", "start": minutes_to_time(start_minutes), "end": source_shift["end"], "hours": shift_length_hours(minutes_to_time(start_minutes), source_shift["end"])})
+    return full_shifts, half_shifts
+
+
+def build_connected_half_shift(day_rules):
+    all_shifts = day_rules["shifts"]
+    if not all_shifts:
+        return None
+    opening_start = min(time_to_minutes(shift["start"]) for shift in all_shifts)
+    closing_end = max(time_to_minutes(shift["end"]) for shift in all_shifts)
+    half_start = max(opening_start, closing_end - int(HALF_SHIFT_HOURS * 60))
+    return {
+        "label": "Puse",
+        "start": minutes_to_time(half_start),
+        "end": minutes_to_time(closing_end),
+        "hours": shift_length_hours(minutes_to_time(half_start), minutes_to_time(closing_end)),
+    }
+
+
+def build_standard_opening_full_shift(day_rules, year, month, day):
+    all_shifts = day_rules["shifts"]
+    if not all_shifts:
+        return None
+    opening_start = min(time_to_minutes(shift["start"]) for shift in all_shifts)
+    weekday_index = calendar.weekday(year, month, day)
+    default_end = "18:00" if weekday_index == 6 else "18:30"
+    target_end = time_to_minutes(default_end)
+    return {
+        "label": "Pilna 1",
+        "start": minutes_to_time(opening_start),
+        "end": default_end,
+        "hours": shift_length_hours(minutes_to_time(opening_start), default_end),
+    }
+
+
+def adjust_shift_for_special_opening(year, month, day, shift, index):
+    weekday_index = calendar.weekday(year, month, day)
+    if weekday_index != 6 or index != 0:
+        return shift
+
+    adjusted = deepcopy(shift)
+    adjusted["start"] = "09:30"
+    if adjusted["role"] == "full":
+        adjusted["end"] = "18:00"
+        adjusted["hours"] = 8.0
+    return adjusted
+
+
+def get_full_shift_for_requested_index(full_templates, index):
+    if index < len(full_templates):
+        return deepcopy(full_templates[index]), False
+    if not full_templates:
+        return None, False
+
+    source_shift = max(
+        full_templates,
+        key=lambda item: (time_to_minutes(item["end"]), time_to_minutes(item["start"])),
+    )
+    return deepcopy(source_shift), True
+
+
+def build_default_demand_values(location_id, year, month):
+    values = []
+    for day in range(1, get_days_in_month(year, month) + 1):
+        weekday_index = calendar.weekday(year, month, day)
+        full_shifts, half_shifts = split_template_shifts(get_day_rules_for_weekday(location_id, weekday_index))
+        values.append(len(full_shifts) + (0.5 if half_shifts else 0.0))
+    return values
+
+
+def build_default_demand_raw(location_id, year, month):
+    return "\n".join(format_demand_value(value) for value in build_default_demand_values(location_id, year, month))
+
+
+def sanitize_schedule_settings(raw_settings):
+    raw_settings = raw_settings if isinstance(raw_settings, dict) else {}
+    return {
+        "month": sanitize_int(raw_settings.get("month"), DEFAULT_MONTH, 1, 12),
+        "year": sanitize_int(raw_settings.get("year"), DEFAULT_YEAR, 2000, 2100),
+        "full_time_hours": sanitize_int(
+            raw_settings.get("full_time_hours"),
+            DEFAULT_FULL_TIME_HOURS,
+            1,
+            250,
+        ),
+    }
+
+
+def sanitize_workers(raw_workers):
+    workers = []
+    for worker in raw_workers if isinstance(raw_workers, list) else []:
+        if not isinstance(worker, dict):
+            continue
+        name = str(worker.get("name") or "").strip()
+        etatas = str(worker.get("etatas") or "").strip()
+        if not name or not etatas:
+            continue
+        workers.append({"id": str(worker.get("id") or uuid4().hex), "name": name, "etatas": etatas, "availability_raw": str(worker.get("availability_raw") or "").strip()})
+    return workers
+
+
+def sanitize_schedule_insights(raw_insights):
+    if not isinstance(raw_insights, dict) or not isinstance(raw_insights.get("items"), list):
+        return None
+    return {"items": [str(item) for item in raw_insights["items"] if str(item).strip()], "ai_used": bool(raw_insights.get("ai_used")), "ai_status": str(raw_insights.get("ai_status") or "").strip()}
+
+
+def sanitize_demand_raw(raw_text, location_id, schedule_settings):
+    year, month = schedule_settings["year"], schedule_settings["month"]
+    defaults = build_default_demand_values(location_id, year, month)
+    lines = [line.strip() for line in str(raw_text or "").splitlines()]
+    normalized = []
+    for index in range(get_days_in_month(year, month)):
+        raw_value = lines[index] if index < len(lines) else defaults[index]
+        normalized.append(format_demand_value(sanitize_demand_value(raw_value, defaults[index])))
+    return "\n".join(normalized)
+
+
+def sanitize_location(raw_location, config):
+    raw_location = raw_location if isinstance(raw_location, dict) else {}
+    schedule_settings = sanitize_schedule_settings(raw_location.get("schedule_settings"))
+    generated_schedule = raw_location.get("generated_schedule") if isinstance(raw_location.get("generated_schedule"), list) else []
+    return {
+        "name": str(raw_location.get("name") or config["name"]),
+        "schedule_settings": schedule_settings,
+        "demand_raw": sanitize_demand_raw(raw_location.get("demand_raw", ""), config["id"], schedule_settings),
+        "workers": sanitize_workers(raw_location.get("workers")),
+        "generated_schedule": generated_schedule,
+        "worker_summary": raw_location.get("worker_summary") if isinstance(raw_location.get("worker_summary"), list) else None,
+        "schedule_insights": sanitize_schedule_insights(raw_location.get("schedule_insights")),
+    }
+
+
+def load_app_data():
+    raw_data = {}
+    if DATA_FILE.exists():
+        try:
+            raw_data = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_data = {}
+    raw_locations = raw_data.get("locations", {}) if isinstance(raw_data, dict) else {}
+    stored_rules_version = raw_data.get("rules_version") if isinstance(raw_data, dict) else None
+    locations = {config["id"]: sanitize_location(raw_locations.get(config["id"]), config) for config in LOCATION_CONFIGS}
+    if stored_rules_version != RULES_VERSION:
+        for location in locations.values():
+            location["generated_schedule"] = []
+            location["worker_summary"] = None
+            location["schedule_insights"] = None
+    return {"rules_version": RULES_VERSION, "locations": locations}
+
+
+def save_app_data():
+    DATA_FILE.write_text(json.dumps(app_data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+app_data = load_app_data()
+save_app_data()
+EXPORTS_DIR.mkdir(exist_ok=True)
+
+
+def parse_availability_lines(raw_text):
+    normalized = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+    lines = [line.strip() for line in normalized.split("\n")]
+    while lines and not lines[-1]:
+        lines.pop()
+    return lines
+
+
+def parse_daily_demand_map(raw_text, year, month, location_id):
+    defaults = build_default_demand_values(location_id, year, month)
+    lines = [line.strip() for line in str(raw_text or "").splitlines()]
+    demand_map, demand_rows = {}, []
+    for day in range(1, get_days_in_month(year, month) + 1):
+        raw_value = lines[day - 1] if day - 1 < len(lines) else defaults[day - 1]
+        value = sanitize_demand_value(raw_value, defaults[day - 1])
+        demand_map[day] = value
+        demand_rows.append({"day": day, "weekday_name": weekday_name_from_index(calendar.weekday(year, month, day)), "value": value, "label": format_demand_value(value), "requested_hours": int(value * 8)})
+    return demand_map, demand_rows
+
+
+def get_worker_status(day_count, expected_days, filled_day_count=None):
+    filled_day_count = day_count if filled_day_count is None else filled_day_count
+    if day_count > expected_days:
+        return f"Per daug: +{day_count - expected_days} d."
+    if filled_day_count < expected_days:
+        return f"Truksta {expected_days - filled_day_count} d."
+    if day_count == expected_days:
+        return "Gerai"
+    return f"Truksta {expected_days - day_count} d."
+
+
+def extract_time(text):
+    match = re.search(r"(\d{1,2})(?:[:.](\d{2}))?", text)
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2)) if match.group(2) else 0
+    return f"{hour:02d}:{minute:02d}" if 0 <= hour <= 23 and 0 <= minute <= 59 else None
+
+
+def extract_all_times(text):
+    times = []
+    for hour_text, minute_text in re.findall(r"(\d{1,2})(?:[:.](\d{2}))?", text):
+        hour = int(hour_text)
+        minute = int(minute_text) if minute_text else 0
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            times.append(f"{hour:02d}:{minute:02d}")
+    return times
+
+
+def build_unknown_parse_result(original, parsed_text="Neatpazinta"):
+    return {"original": original.strip(), "type": "unknown", "from_time": None, "until_time": None, "second_from_time": None, "preference": None, "parsed_text": parsed_text, "parser_source": "rules", "confidence": None, "ai_notes": None}
+
+
+def parse_single_line_rule_based(line):
+    original = line.strip()
+    normalized = normalize_text(original)
+    normalized_clean = re.sub(r"\s+", " ", normalized).strip(" .,-")
+    result = build_unknown_parse_result(original)
+    if any(word in normalized for word in ["rytas", "rytine", "rytines", "geriau rytas", "noriu rytines"]):
+        result["preference"] = "morning"
+    elif any(word in normalized for word in ["vakaras", "vakarine", "vakaro", "geriau vakaras"]):
+        result["preference"] = "evening"
+    if normalized_clean in {"?", "nzn", "nzn da", "nezinau"}:
+        result["type"], result["parsed_text"] = "uncertain", "Dar nezino"
+        return result
+    if normalized_clean in {"a", "atostogos", "l", "liga", "n", "ne", "off"} or "negaliu" in normalized:
+        result["type"], result["parsed_text"] = "unavailable", "Negali dirbti"
+        return result
+    if "atsidarym" in normalized:
+        result["type"], result["parsed_text"] = "available", "Gali nuo atsidarymo"
+        return result
+    if "iki" in normalized and "nuo" in normalized:
+        parts = re.split(r"\s*/\s*|\s+ir\s+", normalized)
+        for part in parts:
+            if "iki" in part:
+                result["until_time"] = extract_time(part)
+            if "nuo" in part:
+                result["second_from_time"] = extract_time(part)
+        result["type"] = "split"
+        result["parsed_text"] = f"Gali iki {result['until_time']} ir nuo {result['second_from_time']}" if result["until_time"] and result["second_from_time"] else "Padalintas laikas"
+        return result
+    time_values = extract_all_times(normalized)
+    if len(time_values) >= 2 and "-" in normalized and "iki" not in normalized and "nuo" not in normalized:
+        result["type"], result["from_time"], result["until_time"] = "time_range", time_values[0], time_values[1]
+        result["parsed_text"] = f"Gali nuo {time_values[0]} iki {time_values[1]}"
+        return result
+    if "nuo" in normalized:
+        result["type"], result["from_time"] = "from_time", extract_time(normalized)
+        result["parsed_text"] = f"Gali nuo {result['from_time']}" if result["from_time"] else "Gali nuo veliau"
+        return result
+    if "iki" in normalized:
+        result["type"], result["until_time"] = "until_time", extract_time(normalized)
+        result["parsed_text"] = f"Gali iki {result['until_time']}" if result["until_time"] else "Gali iki anksciau"
+        return result
+    if time_values:
+        result["type"], result["from_time"], result["parsed_text"] = "from_time", time_values[0], f"Gali nuo {time_values[0]}"
+        return result
+    if "galiu" in normalized or result["preference"] in {"morning", "evening"}:
+        result["type"] = "available"
+        result["parsed_text"] = "Gali visa diena"
+    return result
+
+
+def get_ai_status():
+    enabled = bool(os.getenv("OPENAI_API_KEY"))
+    status = f"AI suggestions enabled ({DEFAULT_AI_MODEL})" if enabled else "Rules engine active"
+    return {"enabled": enabled, "status": status}
+
+
+def extract_response_text(response_json):
+    output_text = response_json.get("output_text")
+    if isinstance(output_text, str) and output_text.strip():
+        return output_text.strip()
+    parts = []
+    for item in response_json.get("output", []) if isinstance(response_json.get("output"), list) else []:
+        if item.get("type") != "message":
+            continue
+        for content_item in item.get("content", []):
+            if content_item.get("type") == "output_text":
+                parts.append(content_item.get("text", ""))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def call_openai_json(prompt, schema_hint):
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        return None, "OPENAI_API_KEY nerastas"
+    body = {
+        "model": DEFAULT_AI_MODEL,
+        "input": [
+            {"role": "system", "content": f"Reply with valid JSON only. Follow this shape: {schema_hint}"},
+            {"role": "user", "content": prompt},
+        ],
+    }
+    request_obj = urllib.request.Request(
+        "https://api.openai.com/v1/responses",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request_obj, timeout=20) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        try:
+            details = exc.read().decode("utf-8")
+        except Exception:
+            details = str(exc)
+        return None, f"AI klaida: {details[:200]}"
+    except Exception as exc:
+        return None, f"AI klaida: {exc}"
+    raw_text = extract_response_text(payload)
+    if not raw_text:
+        return None, "AI negrazino teksto"
+    try:
+        return json.loads(raw_text), None
+    except json.JSONDecodeError:
+        for pattern in (r"\{.*\}", r"\[.*\]"):
+            match = re.search(pattern, raw_text, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group(0)), None
+                except json.JSONDecodeError:
+                    pass
+        return None, "AI grazino ne JSON"
+
+
+def normalize_ai_availability_result(original, payload):
+    if not isinstance(payload, dict):
+        return None
+    result = build_unknown_parse_result(original)
+    result["parser_source"] = "ai"
+    result["confidence"] = safe_float(payload.get("confidence"), 0.0) or None
+    result["ai_notes"] = str(payload.get("notes") or "").strip() or None
+    parsed_type = str(payload.get("type") or "unknown").strip().lower()
+    if parsed_type not in {"available", "unavailable", "uncertain", "from_time", "until_time", "time_range", "split", "unknown"}:
+        parsed_type = "unknown"
+    result["type"] = parsed_type
+    for field_name in ("from_time", "until_time", "second_from_time"):
+        value = payload.get(field_name)
+        if value is not None and is_valid_time(str(value).strip()):
+            result[field_name] = str(value).strip()
+    preference = str(payload.get("preference") or "").strip().lower()
+    if preference in {"morning", "evening"}:
+        result["preference"] = preference
+    parsed_text = str(payload.get("parsed_text") or "").strip()
+    if parsed_text:
+        result["parsed_text"] = parsed_text
+    return result
+
+
+def maybe_parse_availability_with_ai(line, fallback):
+    if fallback["type"] not in {"unknown", "uncertain"}:
+        return fallback
+    prompt = (
+        "Parse this employee availability note for one day and return JSON only. "
+        "Use type from: available, unavailable, uncertain, from_time, until_time, time_range, split, unknown. "
+        "Return HH:MM times. Text: " + line
+    )
+    schema_hint = '{"type":"unknown","from_time":null,"until_time":null,"second_from_time":null,"preference":null,"parsed_text":"","confidence":0.0,"notes":""}'
+    payload, error = call_openai_json(prompt, schema_hint)
+    normalized = normalize_ai_availability_result(line, payload)
+    if normalized:
+        if error:
+            normalized["ai_notes"] = error
+        return normalized
+    fallback["ai_notes"] = error
+    return fallback
 
 
 def parse_single_line(line):
-    original = line.strip()
-    normalized = normalize_text(original)
-
-    result = {
-        "original": original,
-        "type": "unknown",
-        "from_time": None,
-        "until_time": None,
-        "second_from_time": None,
-        "preference": None,
-        "parsed_text": "Neatpažinta"
-    }
-
-    morning_words = [
-        "rytas",
-        "rytine",
-        "rytines",
-        "geriau rytas",
-        "noriu rytines"
-    ]
-
-    if any(word in normalized for word in morning_words):
-        result["preference"] = "Rytinė pageidaujama"
-
-    if "negaliu" in normalized:
-        result["type"] = "unavailable"
-        result["parsed_text"] = "Negali dirbti"
-        return result
-
-    if "iki" in normalized and "nuo" in normalized and "/" in normalized:
-        parts = normalized.split("/")
-
-        until_time = None
-        from_time = None
-
-        for part in parts:
-            part = part.strip()
-
-            if "iki" in part:
-                until_time = extract_time(part)
-
-            if "nuo" in part:
-                from_time = extract_time(part)
-
-        result["type"] = "split"
-        result["until_time"] = until_time
-        result["second_from_time"] = from_time
-
-        if until_time and from_time:
-            result["parsed_text"] = f"Gali iki {until_time} ir nuo {from_time}"
-        else:
-            result["parsed_text"] = "Padalintas laikas"
-
-        return result
-
-    if "nuo" in normalized:
-        time_value = extract_time(normalized)
-
-        result["type"] = "from_time"
-        result["from_time"] = time_value
-        result["parsed_text"] = f"Gali nuo {time_value}" if time_value else "Gali nuo tam tikro laiko"
-        return result
-
-    if "iki" in normalized:
-        time_value = extract_time(normalized)
-
-        result["type"] = "until_time"
-        result["until_time"] = time_value
-        result["parsed_text"] = f"Gali iki {time_value}" if time_value else "Gali iki tam tikro laiko"
-        return result
-
-    if "galiu" in normalized:
-        result["type"] = "available"
-        result["parsed_text"] = "Gali visą dieną"
-        return result
-
-    if any(word in normalized for word in morning_words):
-        result["type"] = "available"
-        result["parsed_text"] = "Gali visą dieną (pageidauja rytinės)"
-        return result
-
-    return result
+    return maybe_parse_availability_with_ai(line, parse_single_line_rule_based(line))
 
 
 def check_one_shift_fit(parsed_item, shift_start, shift_end):
     shift_start_min = time_to_minutes(shift_start)
     shift_end_min = time_to_minutes(shift_end)
-
-    result = {
-        "ok": False,
-        "reason": "Neatpažinta",
-        "assigned_start": shift_start,
-        "assigned_end": shift_end,
-        "is_shortened": False
-    }
-
+    result = {"ok": False, "reason": "Neatpazinta", "assigned_start": shift_start, "assigned_end": shift_end, "is_shortened": False}
     def valid_short_shift(start_min, end_min):
-        length = end_min - start_min
-        return length >= 270  # 4.5 val minimum
-
+        return end_min - start_min >= MIN_SHORT_SHIFT_MINUTES
     if parsed_item["type"] == "available":
-        result["ok"] = True
-        result["reason"] = "Gali visą dieną"
+        result["ok"], result["reason"] = True, parsed_item["parsed_text"]
         return result
-
-    if parsed_item["type"] == "unavailable":
-        result["ok"] = False
-        result["reason"] = "Negali dirbti"
+    if parsed_item["type"] in {"unavailable", "uncertain"}:
+        result["reason"] = parsed_item["parsed_text"]
         return result
-
     if parsed_item["type"] == "from_time" and parsed_item["from_time"]:
         available_from = time_to_minutes(parsed_item["from_time"])
-
         if available_from <= shift_start_min:
-            result["ok"] = True
-            result["reason"] = f"Gali nuo {parsed_item['from_time']}"
+            result["ok"], result["reason"] = True, f"Gali nuo {parsed_item['from_time']}"
             return result
-
-        if shift_start_min < available_from < shift_end_min:
-            if valid_short_shift(available_from, shift_end_min):
-                result["ok"] = True
-                result["reason"] = f"Sutrumpinta pamaina nuo {parsed_item['from_time']}"
-                result["assigned_start"] = minutes_to_time(available_from)
-                result["assigned_end"] = shift_end
-                result["is_shortened"] = True
-                return result
-
-        result["ok"] = False
-        result["reason"] = f"Gali nuo {parsed_item['from_time']}"
+        if shift_start_min < available_from < shift_end_min and valid_short_shift(available_from, shift_end_min):
+            result.update({"ok": True, "reason": f"Sutrumpinta pamaina nuo {parsed_item['from_time']}", "assigned_start": minutes_to_time(available_from), "is_shortened": True})
         return result
-
     if parsed_item["type"] == "until_time" and parsed_item["until_time"]:
         available_until = time_to_minutes(parsed_item["until_time"])
-
         if available_until >= shift_end_min:
-            result["ok"] = True
-            result["reason"] = f"Gali iki {parsed_item['until_time']}"
+            result["ok"], result["reason"] = True, f"Gali iki {parsed_item['until_time']}"
             return result
-
-        if shift_start_min < available_until < shift_end_min:
-            if valid_short_shift(shift_start_min, available_until):
-                result["ok"] = True
-                result["reason"] = f"Sutrumpinta pamaina iki {parsed_item['until_time']}"
-                result["assigned_start"] = shift_start
-                result["assigned_end"] = minutes_to_time(available_until)
-                result["is_shortened"] = True
-                return result
-
-        result["ok"] = False
-        result["reason"] = f"Gali iki {parsed_item['until_time']}"
+        if shift_start_min < available_until < shift_end_min and valid_short_shift(shift_start_min, available_until):
+            result.update({"ok": True, "reason": f"Sutrumpinta pamaina iki {parsed_item['until_time']}", "assigned_end": minutes_to_time(available_until), "is_shortened": True})
         return result
-
+    if parsed_item["type"] == "time_range" and parsed_item["from_time"] and parsed_item["until_time"]:
+        overlap_start = max(shift_start_min, time_to_minutes(parsed_item["from_time"]))
+        overlap_end = min(shift_end_min, time_to_minutes(parsed_item["until_time"]))
+        if overlap_start == shift_start_min and overlap_end == shift_end_min:
+            result["ok"], result["reason"] = True, parsed_item["parsed_text"]
+            return result
+        if valid_short_shift(overlap_start, overlap_end):
+            result.update({"ok": True, "reason": f"Sutrumpinta pamaina {minutes_to_time(overlap_start)}-{minutes_to_time(overlap_end)}", "assigned_start": minutes_to_time(overlap_start), "assigned_end": minutes_to_time(overlap_end), "is_shortened": True})
+        return result
     if parsed_item["type"] == "split" and parsed_item["until_time"] and parsed_item["second_from_time"]:
         first_end = time_to_minutes(parsed_item["until_time"])
         second_start = time_to_minutes(parsed_item["second_from_time"])
-
         if shift_end_min <= first_end:
-            result["ok"] = True
-            result["reason"] = f"Gali iki {parsed_item['until_time']}"
+            result["ok"], result["reason"] = True, f"Gali iki {parsed_item['until_time']}"
             return result
-
         if second_start <= shift_start_min:
-            result["ok"] = True
-            result["reason"] = f"Gali nuo {parsed_item['second_from_time']}"
+            result["ok"], result["reason"] = True, f"Gali nuo {parsed_item['second_from_time']}"
             return result
-
-        if shift_start_min < first_end < shift_end_min:
-            if valid_short_shift(shift_start_min, first_end):
-                result["ok"] = True
-                result["reason"] = f"Sutrumpinta pamaina iki {parsed_item['until_time']}"
-                result["assigned_start"] = shift_start
-                result["assigned_end"] = minutes_to_time(first_end)
-                result["is_shortened"] = True
-                return result
-
-        if shift_start_min < second_start < shift_end_min:
-            if valid_short_shift(second_start, shift_end_min):
-                result["ok"] = True
-                result["reason"] = f"Sutrumpinta pamaina nuo {parsed_item['second_from_time']}"
-                result["assigned_start"] = minutes_to_time(second_start)
-                result["assigned_end"] = shift_end
-                result["is_shortened"] = True
-                return result
-
-        result["ok"] = False
-        result["reason"] = f"Gali iki {parsed_item['until_time']} ir nuo {parsed_item['second_from_time']}"
+        if shift_start_min < first_end < shift_end_min and valid_short_shift(shift_start_min, first_end):
+            result.update({"ok": True, "reason": f"Sutrumpinta pamaina iki {parsed_item['until_time']}", "assigned_end": minutes_to_time(first_end), "is_shortened": True})
+            return result
+        if shift_start_min < second_start < shift_end_min and valid_short_shift(second_start, shift_end_min):
+            result.update({"ok": True, "reason": f"Sutrumpinta pamaina nuo {parsed_item['second_from_time']}", "assigned_start": minutes_to_time(second_start), "is_shortened": True})
         return result
-
     return result
 
 
 def build_shift_fit_for_day(parsed_item, shifts):
     fit = []
-
     for shift in shifts:
         fit_result = check_one_shift_fit(parsed_item, shift["start"], shift["end"])
-
-        fit.append({
-            "label": shift["label"],
-            "start": shift["start"],
-            "end": shift["end"],
-            "ok": fit_result["ok"],
-            "reason": fit_result["reason"],
-            "assigned_start": fit_result["assigned_start"],
-            "assigned_end": fit_result["assigned_end"],
-            "is_shortened": fit_result["is_shortened"]
-        })
-
+        fit.append({"label": shift["label"], "start": shift["start"], "end": shift["end"], "ok": fit_result["ok"], "reason": fit_result["reason"], "assigned_start": fit_result["assigned_start"], "assigned_end": fit_result["assigned_end"], "is_shortened": fit_result["is_shortened"]})
     return fit
 
 
-def get_day_type(year, month, day):
-    weekday_index = calendar.weekday(year, month, day)
-    # 0=Mon ... 6=Sun
-    if weekday_index <= 3:
-        return "weekday", weekday_index
-    return "weekend", weekday_index
+def build_requested_shifts(location_id, year, month, day, demand_value):
+    day_rules = get_day_rules_for_weekday(location_id, calendar.weekday(year, month, day))
+    full_templates, half_templates = split_template_shifts(day_rules)
+    full_count = int(demand_value)
+    needs_half = abs(demand_value - full_count - 0.5) < 0.01
+    warnings, shifts = [], []
+    if full_count > len(full_templates):
+        if full_templates:
+            override_source = max(
+                full_templates,
+                key=lambda item: (time_to_minutes(item["end"]), time_to_minutes(item["start"])),
+            )
+            warnings.append(
+                f"Poreikis {format_demand_value(demand_value)} virsija pilnu pamainu sablona ({len(full_templates)}). "
+                f"Papildomos pamainos kuriamos kaip override pagal {override_source['start']}-{override_source['end']}."
+            )
+        else:
+            warnings.append(f"Poreikis {format_demand_value(demand_value)} virsija pilnu pamainu sablona (0).")
+    connected_half_shift = build_connected_half_shift(day_rules) if needs_half else None
+
+    if full_count == 1 and needs_half and connected_half_shift:
+        connected_full_shift = build_standard_opening_full_shift(day_rules, year, month, day)
+        if connected_full_shift:
+            connected_full_shift.update({"role": "full", "slot_kind": "Pilna", "label": "Pilna 1"})
+            connected_full_shift = adjust_shift_for_special_opening(year, month, day, connected_full_shift, 0)
+            shifts.append(connected_full_shift)
+        half_shift = deepcopy(connected_half_shift)
+        half_shift.update({"role": "half", "slot_kind": "Puse", "label": "Puse"})
+        shifts.append(half_shift)
+    else:
+        for index in range(full_count):
+            shift, is_override = get_full_shift_for_requested_index(full_templates, index)
+            if not shift:
+                continue
+            if index == 0 and needs_half and connected_half_shift:
+                standard_shift = build_standard_opening_full_shift(day_rules, year, month, day)
+                if standard_shift:
+                    shift = standard_shift
+                    is_override = False
+            shift.update({"role": "full", "slot_kind": "Pilna+" if is_override else "Pilna", "label": f"Pilna {index + 1}", "template_override": is_override})
+            shift = adjust_shift_for_special_opening(year, month, day, shift, index)
+            shifts.append(shift)
+        if needs_half:
+            if connected_half_shift:
+                half_shift = deepcopy(connected_half_shift)
+                half_shift.update({"role": "half", "slot_kind": "Puse", "label": "Puse"})
+                shifts.append(half_shift)
+            elif half_templates:
+                shift = deepcopy(half_templates[0])
+                shift.update({"role": "half", "slot_kind": "Puse", "label": "Puse"})
+                shifts.append(shift)
+            else:
+                warnings.append("Pusinei pamainai nerastas sablonas.")
+    shifts.sort(key=lambda item: (time_to_minutes(item["start"]), time_to_minutes(item["end"])))
+    return shifts, warnings
 
 
-def weekday_name_from_index(index):
-    names = ["Pr", "An", "Tr", "Kt", "Pn", "Št", "Sk"]
-    return names[index]
-
-
-def parse_worker_availability(lines, year, month):
+def parse_worker_availability(lines, year, month, location_id, demand_map):
     parsed_days = []
-
-    for day, line in enumerate(lines, start=1):
-        parsed = parse_single_line(line)
-        day_type, weekday_index = get_day_type(year, month, day)
-        shifts = schedule_settings["weekday_shifts"] if day_type == "weekday" else schedule_settings["weekend_shifts"]
-        shift_fit = build_shift_fit_for_day(parsed, shifts)
-
-        parsed["day"] = day
-        parsed["day_type"] = day_type
-        parsed["weekday_name"] = weekday_name_from_index(weekday_index)
-        parsed["shift_fit"] = shift_fit
+    for day in range(1, get_days_in_month(year, month) + 1):
+        original_line = lines[day - 1] if day - 1 < len(lines) else ""
+        parsed = parse_single_line(original_line) if original_line else build_unknown_parse_result("", "Tuscia eilute")
+        shifts, _ = build_requested_shifts(location_id, year, month, day, demand_map[day])
+        parsed.update({"day": day, "day_type": get_day_type(year, month, day)[0], "weekday_name": weekday_name_from_index(calendar.weekday(year, month, day)), "shift_fit": build_shift_fit_for_day(parsed, shifts), "has_input": bool(original_line)})
         parsed_days.append(parsed)
-
     return parsed_days
 
 
-def rebuild_all_workers():
-    year = schedule_settings["year"]
-    month = schedule_settings["month"]
-
-    for worker in workers:
-        worker["parsed_availability"] = parse_worker_availability(
-            worker["availability_lines"],
-            year,
-            month
-        )
-        worker["day_count"] = len(worker["availability_lines"])
+def build_worker_runtime(worker, schedule_settings, location_id, demand_map):
+    availability_lines = parse_availability_lines(worker.get("availability_raw", ""))
+    worker_runtime = worker.copy()
+    worker_runtime["availability_lines"] = availability_lines
+    worker_runtime["parsed_availability"] = parse_worker_availability(availability_lines, schedule_settings["year"], schedule_settings["month"], location_id, demand_map)
+    worker_runtime["day_count"] = len(availability_lines)
+    worker_runtime["filled_day_count"] = sum(bool(line) for line in availability_lines)
+    return worker_runtime
 
 
-def calculate_targets(valid_workers, total_shift_count):
-    total_etatas = sum(float(worker["etatas"]) for worker in valid_workers)
-    targets = {}
+def calculate_targets(valid_workers, full_time_hours):
+    return {
+        index: etatas_to_month_hours(worker["etatas"], full_time_hours)
+        for index, worker in enumerate(valid_workers)
+    }
 
-    if total_etatas == 0:
-        for i in range(len(valid_workers)):
-            targets[i] = 0
-        return targets
 
-    for i, worker in enumerate(valid_workers):
-        targets[i] = (float(worker["etatas"]) / total_etatas) * total_shift_count
+def get_assigned_shift_hours(shift, fit_info):
+    return shift_length_hours(fit_info["assigned_start"], fit_info["assigned_end"]) if fit_info["is_shortened"] else shift.get("hours", shift_length_hours(shift["start"], shift["end"]))
 
-    return targets
+
+def would_exceed_consecutive_limit(assigned_days, day, max_streak=MAX_CONSECUTIVE_DAYS):
+    streak = 1
+    previous_day = day - 1
+    while previous_day in assigned_days:
+        streak += 1
+        previous_day -= 1
+    next_day = day + 1
+    while next_day in assigned_days:
+        streak += 1
+        next_day += 1
+    return streak > max_streak
+
+
+def would_break_rest_gap(assignments_by_day, day, assigned_start, assigned_end, min_rest_hours=MIN_REST_HOURS):
+    start_min, end_min = time_to_minutes(assigned_start), time_to_minutes(assigned_end)
+    previous_day_assignment = assignments_by_day.get(day - 1)
+    if previous_day_assignment and (24 * 60 - previous_day_assignment["end"]) + start_min < min_rest_hours * 60:
+        return True
+    next_day_assignment = assignments_by_day.get(day + 1)
+    if next_day_assignment and (24 * 60 - end_min) + next_day_assignment["start"] < min_rest_hours * 60:
+        return True
+    return False
+
+
+def get_processing_day_order(year, month, demand_map):
+    def sort_key(day):
+        day_type, _ = get_day_type(year, month, day)
+        weekend_priority = 0 if day_type == "weekend" else 1
+        return (-demand_map[day], weekend_priority, day)
+    return sorted(range(1, get_days_in_month(year, month) + 1), key=sort_key)
+
+
+def get_day_closing_end_minutes(shifts):
+    return max(time_to_minutes(shift["end"]) for shift in shifts) if shifts else None
+
+
+def is_closing_assignment(assigned_end, closing_end_minutes):
+    return closing_end_minutes is not None and time_to_minutes(assigned_end) == closing_end_minutes
 
 
 def assignment_time_to_minutes(shift_time):
@@ -376,269 +783,770 @@ def assignment_time_to_minutes(shift_time):
     return time_to_minutes(start_str), time_to_minutes(end_str)
 
 
-def has_gap_between_assignments(assignments):
-    usable = [a for a in assignments if a["worker_name"]]
+def can_cover_interval(parsed_day, start_time, end_time):
+    fit = check_one_shift_fit(parsed_day, start_time, end_time)
+    return fit["ok"] and fit["assigned_start"] == start_time and fit["assigned_end"] == end_time
 
+
+def repair_gap_with_availability(assignments, worker_day_map):
+    usable = [assignment for assignment in assignments if assignment["worker_name"]]
+    if len(usable) < 2:
+        return False, None
+
+    usable_sorted = sorted(usable, key=lambda assignment: assignment_time_to_minutes(assignment["shift_time"])[0])
+
+    for index in range(len(usable_sorted) - 1):
+        current = usable_sorted[index]
+        following = usable_sorted[index + 1]
+        current_start, current_end = assignment_time_to_minutes(current["shift_time"])
+        next_start, next_end = assignment_time_to_minutes(following["shift_time"])
+
+        if current_end >= next_start:
+            continue
+
+        gap_start = minutes_to_time(current_end)
+        gap_end = minutes_to_time(next_start)
+
+        current_day = worker_day_map.get(current["worker_index"])
+        if current_day and can_cover_interval(current_day, minutes_to_time(current_start), gap_end):
+            current["shift_time"] = f"{minutes_to_time(current_start)}-{gap_end}"
+            return True, f"Tarpas uzdengtas prailginant {current['worker_name']} pamaina iki {gap_end} (sulauzo bazini sablona)."
+
+        following_day = worker_day_map.get(following["worker_index"])
+        if following_day and can_cover_interval(following_day, gap_start, minutes_to_time(next_end)):
+            following["shift_time"] = f"{gap_start}-{minutes_to_time(next_end)}"
+            return True, f"Tarpas uzdengtas paankstinant {following['worker_name']} pamaina nuo {gap_start} (sulauzo bazini sablona)."
+
+        if current_day and following_day:
+            for bridge_minute in range(current_end + 30, next_start + 1, 30):
+                bridge_time = minutes_to_time(bridge_minute)
+                current_can_extend = can_cover_interval(
+                    current_day,
+                    minutes_to_time(current_start),
+                    bridge_time,
+                )
+                following_can_pull = can_cover_interval(
+                    following_day,
+                    bridge_time,
+                    minutes_to_time(next_end),
+                )
+
+                if current_can_extend and following_can_pull:
+                    current["shift_time"] = f"{minutes_to_time(current_start)}-{bridge_time}"
+                    following["shift_time"] = f"{bridge_time}-{minutes_to_time(next_end)}"
+                    return (
+                        True,
+                        f"Tarpas uzdengtas pastumiant abi pamainas iki {bridge_time} (sulauzo bazini sablona).",
+                    )
+
+    return False, None
+
+
+def has_gap_between_assignments(assignments):
+    usable = [assignment for assignment in assignments if assignment["worker_name"]]
     if len(usable) < 2:
         return False
-
-    usable_sorted = sorted(
-        usable,
-        key=lambda a: assignment_time_to_minutes(a["shift_time"])[0]
-    )
-
-    for i in range(len(usable_sorted) - 1):
-        _, current_end = assignment_time_to_minutes(usable_sorted[i]["shift_time"])
-        next_start, _ = assignment_time_to_minutes(usable_sorted[i + 1]["shift_time"])
-
-        if current_end < next_start:
-            return True
-
-    return False
+    usable_sorted = sorted(usable, key=lambda assignment: assignment_time_to_minutes(assignment["shift_time"])[0])
+    return any(assignment_time_to_minutes(usable_sorted[index]["shift_time"])[1] < assignment_time_to_minutes(usable_sorted[index + 1]["shift_time"])[0] for index in range(len(usable_sorted) - 1))
 
 
 def sort_workers_for_display(worker_list):
-    return sorted(
-        worker_list,
-        key=lambda w: (-float(w["etatas"]), w["name"].lower())
-    )
+    return sorted(worker_list, key=lambda worker: (-safe_float(worker["etatas"]), worker["name"].lower()))
 
 
-def generate_month_schedule():
-    global generated_schedule
+def get_shift_priority_score(worker_index, parsed_day, fit_info, shift, projected_hours, target_hours, assigned_hours, assigned_counts, weekend_counts, closing_counts, day_type, is_closing):
+    score = assigned_hours[worker_index] - target_hours
+    if shift["role"] == "full" and parsed_day.get("preference") == "morning" and shift["start"] <= "11:00":
+        score -= 0.25
+    if parsed_day.get("preference") == "evening" and shift["end"] >= "21:00":
+        score -= 0.2
+    if fit_info["is_shortened"]:
+        score += 0.2
+    if projected_hours > target_hours:
+        score += 5 + (projected_hours - target_hours)
+    if day_type == "weekend":
+        score += weekend_counts[worker_index] * 0.7
+    if is_closing:
+        score += closing_counts[worker_index] * 0.8
+    score += assigned_counts[worker_index] * 0.05
+    return score
 
-    year = schedule_settings["year"]
-    month = schedule_settings["month"]
-    expected_days = get_days_in_month(year, month)
 
-    valid_workers = workers[:]
-    valid_workers = sort_workers_for_display(valid_workers)
+def blocks_closing_shift(parsed_day, is_closing):
+    return is_closing and parsed_day.get("preference") == "morning"
 
-    total_shift_count = 0
-    for day in range(1, expected_days + 1):
-        day_type, _ = get_day_type(year, month, day)
-        if day_type == "weekday":
-            total_shift_count += len(schedule_settings["weekday_shifts"])
-        else:
-            total_shift_count += len(schedule_settings["weekend_shifts"])
 
-    targets = calculate_targets(valid_workers, total_shift_count)
-    assigned_counts = {i: 0 for i in range(len(valid_workers))}
-    assigned_hours = {i: 0.0 for i in range(len(valid_workers))}
-    generated_schedule = []
+def summarize_rejection_reasons(reason_counts):
+    if not reason_counts:
+        return "nerasta tinkamu kandidatu"
 
-    for day in range(1, expected_days + 1):
+    priority = [
+        "jau priskirtas kita pamaina ta diena",
+        "negali dirbti sios pamainos",
+        "virsytu 5 dienas is eiles",
+        "per mazai poilsio tarp pamainu",
+        "ryto pageidavimas blokuoja uzdaryma",
+        "virsytu valandu limita",
+        "nera ivestu galimybiu tai dienai",
+    ]
+
+    best_reason = None
+    best_count = -1
+    for reason in priority:
+        count = reason_counts.get(reason, 0)
+        if count > best_count:
+            best_reason = reason
+            best_count = count
+
+    if best_count <= 0:
+        best_reason, best_count = max(reason_counts.items(), key=lambda item: item[1])
+
+    return f"{best_reason} ({best_count})"
+
+
+def generate_month_schedule(worker_list, schedule_settings, location_id, demand_map):
+    year, month = schedule_settings["year"], schedule_settings["month"]
+    valid_workers = sort_workers_for_display(worker_list[:])
+    targets = calculate_targets(valid_workers, schedule_settings["full_time_hours"])
+    assigned_counts = {index: 0 for index in range(len(valid_workers))}
+    assigned_hours = {index: 0.0 for index in range(len(valid_workers))}
+    assigned_days = {index: set() for index in range(len(valid_workers))}
+    weekend_counts = {index: 0 for index in range(len(valid_workers))}
+    closing_counts = {index: 0 for index in range(len(valid_workers))}
+    assignments_by_worker_day = {index: {} for index in range(len(valid_workers))}
+    day_records_by_day = {}
+    for day in get_processing_day_order(year, month, demand_map):
         day_type, weekday_index = get_day_type(year, month, day)
-        weekday_name = weekday_name_from_index(weekday_index)
-        shifts = schedule_settings["weekday_shifts"] if day_type == "weekday" else schedule_settings["weekend_shifts"]
+        shifts, day_warnings = build_requested_shifts(location_id, year, month, day, demand_map[day])
+        closing_end_minutes = get_day_closing_end_minutes(shifts)
+        assignments_for_day, assigned_today = [], set()
+        assigned_worker_days = {}
+        day_record = {"day": day, "weekday_name": weekday_name_from_index(weekday_index), "day_type": day_type, "demand_value": demand_map[day], "demand_label": format_demand_value(demand_map[day]), "requested_hours": int(demand_map[day] * 8), "assignments": [], "warnings": list(day_warnings)}
 
-        day_record = {
-            "day": day,
-            "weekday_name": weekday_name,
-            "day_type": day_type,
-            "assignments": [],
-            "warnings": []
-        }
-
-        assigned_today = set()
+        if demand_map[day] == 0:
+            day_record["warnings"].append("Lokacija nedirba")
+            day_records_by_day[day] = day_record
+            continue
 
         for shift_index, shift in enumerate(shifts):
             candidates = []
-
+            rejection_reasons = {}
             for worker_index, worker in enumerate(valid_workers):
                 if worker_index in assigned_today:
+                    rejection_reasons["jau priskirtas kita pamaina ta diena"] = rejection_reasons.get("jau priskirtas kita pamaina ta diena", 0) + 1
                     continue
-
-                if day - 1 >= len(worker["parsed_availability"]):
-                    continue
-
                 parsed_day = worker["parsed_availability"][day - 1]
-                shift_fit = parsed_day["shift_fit"]
-
-                if shift_index >= len(shift_fit):
+                if shift_index >= len(parsed_day["shift_fit"]):
+                    rejection_reasons["nera ivestu galimybiu tai dienai"] = rejection_reasons.get("nera ivestu galimybiu tai dienai", 0) + 1
                     continue
-
-                fit_info = shift_fit[shift_index]
+                fit_info = parsed_day["shift_fit"][shift_index]
                 if not fit_info["ok"]:
+                    rejection_reasons["negali dirbti sios pamainos"] = rejection_reasons.get("negali dirbti sios pamainos", 0) + 1
                     continue
-
-                score = assigned_counts[worker_index] - targets[worker_index]
-
-                if shift_index == 0 and parsed_day.get("preference") == "Rytinė pageidaujama":
-                    score -= 0.25
-
-                # lengvas prioritetas pilnai pamainai prieš sutrumpintą
-                if fit_info["is_shortened"]:
-                    score += 0.15
-
-                candidates.append((score, worker_index, worker["name"], fit_info))
-
-            candidates.sort(key=lambda x: x[0])
-
+                if would_exceed_consecutive_limit(assigned_days[worker_index], day):
+                    rejection_reasons["virsytu 5 dienas is eiles"] = rejection_reasons.get("virsytu 5 dienas is eiles", 0) + 1
+                    continue
+                if would_break_rest_gap(assignments_by_worker_day[worker_index], day, fit_info["assigned_start"], fit_info["assigned_end"]):
+                    rejection_reasons["per mazai poilsio tarp pamainu"] = rejection_reasons.get("per mazai poilsio tarp pamainu", 0) + 1
+                    continue
+                shift_hours = get_assigned_shift_hours(shift, fit_info)
+                projected_hours = assigned_hours[worker_index] + shift_hours
+                if projected_hours > targets[worker_index] + 24:
+                    rejection_reasons["virsytu valandu limita"] = rejection_reasons.get("virsytu valandu limita", 0) + 1
+                    continue
+                is_closing = is_closing_assignment(fit_info["assigned_end"], closing_end_minutes)
+                if blocks_closing_shift(parsed_day, is_closing):
+                    rejection_reasons["ryto pageidavimas blokuoja uzdaryma"] = rejection_reasons.get("ryto pageidavimas blokuoja uzdaryma", 0) + 1
+                    continue
+                candidates.append((get_shift_priority_score(worker_index, parsed_day, fit_info, shift, projected_hours, targets[worker_index], assigned_hours, assigned_counts, weekend_counts, closing_counts, day_type, is_closing), assigned_counts[worker_index], worker_index, worker["name"], fit_info, shift_hours, is_closing))
+            candidates.sort(key=lambda item: (item[0], item[1], item[3].lower()))
             if candidates:
-                _, chosen_index, chosen_name, chosen_fit = candidates[0]
+                _, _, chosen_index, chosen_name, chosen_fit, chosen_shift_hours, chosen_is_closing = candidates[0]
                 assigned_today.add(chosen_index)
                 assigned_counts[chosen_index] += 1
-
-                shift_hours = shift_length_hours(
-                    chosen_fit["assigned_start"],
-                    chosen_fit["assigned_end"]
-                )
-                assigned_hours[chosen_index] += shift_hours
-
-                day_record["assignments"].append({
-                    "shift_label": shift["label"],
-                    "shift_time": f"{chosen_fit['assigned_start']}-{chosen_fit['assigned_end']}",
-                    "worker_name": chosen_name
-                })
+                assigned_hours[chosen_index] += chosen_shift_hours
+                assigned_days[chosen_index].add(day)
+                if day_type == "weekend":
+                    weekend_counts[chosen_index] += 1
+                if chosen_is_closing:
+                    closing_counts[chosen_index] += 1
+                assignments_by_worker_day[chosen_index][day] = {"start": time_to_minutes(chosen_fit["assigned_start"]), "end": time_to_minutes(chosen_fit["assigned_end"])}
+                assigned_worker_days[chosen_index] = valid_workers[chosen_index]["parsed_availability"][day - 1]
+                assignments_for_day.append({"shift_label": shift["label"], "slot_kind": shift["slot_kind"], "shift_time": f"{chosen_fit['assigned_start']}-{chosen_fit['assigned_end']}", "worker_name": chosen_name, "worker_index": chosen_index})
             else:
-                day_record["assignments"].append({
-                    "shift_label": shift["label"],
-                    "shift_time": f"{shift['start']}-{shift['end']}",
-                    "worker_name": None
-                })
-                day_record["warnings"].append(
-                    f"Nėra darbuotojo {shift['label']} ({shift['start']}-{shift['end']})"
-                )
-
+                assignments_for_day.append({"shift_label": shift["label"], "slot_kind": shift["slot_kind"], "shift_time": f"{shift['start']}-{shift['end']}", "worker_name": None, "worker_index": None})
+                reason_text = summarize_rejection_reasons(rejection_reasons)
+                day_record["warnings"].append(f"Nera darbuotojo {shift['label']} ({shift['start']}-{shift['end']}) del: {reason_text}")
+        gap_repaired, gap_warning = repair_gap_with_availability(assignments_for_day, assigned_worker_days)
+        if gap_repaired and gap_warning:
+            day_record["warnings"].append(gap_warning)
+        day_record["assignments"] = assignments_for_day
         if has_gap_between_assignments(day_record["assignments"]):
-            day_record["warnings"].append("Yra tarpas grafike – parduotuvė liktų tuščia")
+            day_record["warnings"].append("Yra tarpas grafike - parduotuve liktu tuscia")
+        for assignment in day_record["assignments"]:
+            assignment.pop("worker_index", None)
+        day_records_by_day[day] = day_record
+    generated_schedule = [day_records_by_day.get(day, {"day": day, "weekday_name": weekday_name_from_index(calendar.weekday(year, month, day)), "demand_label": format_demand_value(demand_map[day]), "assignments": [], "warnings": []}) for day in range(1, get_days_in_month(year, month) + 1)]
+    worker_summary = [{"name": worker["name"], "etatas": worker["etatas"], "assigned_shifts": assigned_counts[index], "assigned_hours": round(assigned_hours[index], 1), "target_hours": round(targets[index], 1), "hours_difference": round(assigned_hours[index] - targets[index], 1), "weekend_days": weekend_counts[index], "closing_shifts": closing_counts[index]} for index, worker in enumerate(valid_workers)]
+    worker_summary = sorted(worker_summary, key=lambda worker: (-safe_float(worker["etatas"]), worker["name"].lower()))
+    return generated_schedule, worker_summary
 
-        generated_schedule.append(day_record)
 
-    worker_summary = []
-    for i, worker in enumerate(valid_workers):
-        target_hours = etatas_to_month_hours(worker["etatas"])
+def build_rule_insights(generated_schedule, worker_summary):
+    insights = []
+    uncovered_days = [day for day in generated_schedule if any(not assignment["worker_name"] for assignment in day["assignments"])]
+    if uncovered_days:
+        insights.append(f"Truksta padengimo {len(uncovered_days)} dienu: " + ", ".join(str(day["day"]) for day in uncovered_days[:8]) + ".")
+    overloaded = [worker for worker in worker_summary if worker["hours_difference"] > 8]
+    if overloaded:
+        top_worker = max(overloaded, key=lambda item: item["hours_difference"])
+        insights.append(f"{top_worker['name']} yra labiausiai perkrautas: +{top_worker['hours_difference']} val.")
+    underloaded = [worker for worker in worker_summary if worker["hours_difference"] < -8]
+    if underloaded:
+        top_worker = min(underloaded, key=lambda item: item["hours_difference"])
+        insights.append(f"{top_worker['name']} labiausiai atsilieka nuo etato: {top_worker['hours_difference']} val.")
+    weekend_heavy = [worker for worker in worker_summary if worker["weekend_days"] >= 4]
+    if weekend_heavy:
+        insights.append("Daug savaitgaliu tenka: " + ", ".join(worker["name"] for worker in weekend_heavy[:4]) + ".")
+    return insights or ["Pagal taisykles grafikas atrodo subalansuotas."]
 
-        worker_summary.append({
-            "name": worker["name"],
-            "etatas": worker["etatas"],
-            "assigned_shifts": assigned_counts[i],
-            "assigned_hours": round(assigned_hours[i], 1),
-            "target_hours": round(target_hours, 1),
-            "hours_difference": round(assigned_hours[i] - target_hours, 1)
+
+def build_ai_schedule_suggestions(location_name, generated_schedule, worker_summary):
+    prompt = "Pasiulyk iki 5 trumpu praktisku patobulinimu lietuviskai siam grafikui. Grazink JSON. " + json.dumps({"location": location_name, "uncovered_days": [{"day": day["day"], "warnings": day["warnings"]} for day in generated_schedule if any(not assignment["worker_name"] for assignment in day["assignments"])], "worker_summary": worker_summary}, ensure_ascii=False)
+    response_json, error = call_openai_json(prompt, '{"suggestions":["..."]}')
+    if error:
+        return None, error
+    if isinstance(response_json, dict) and isinstance(response_json.get("suggestions"), list):
+        cleaned = [str(item).strip() for item in response_json["suggestions"] if str(item).strip()]
+        if cleaned:
+            return cleaned[:5], None
+    return None, "AI nepateike pasiulymu"
+
+
+def build_schedule_insights(location, generated_schedule, worker_summary):
+    items = build_rule_insights(generated_schedule, worker_summary)
+    ai_status = get_ai_status()
+    if not ai_status["enabled"]:
+        return {"items": items, "ai_used": False, "ai_status": ai_status["status"]}
+    ai_items, ai_error = build_ai_schedule_suggestions(location["name"], generated_schedule, worker_summary)
+    if ai_items:
+        items.extend(ai_items)
+    return {"items": items, "ai_used": bool(ai_items), "ai_status": ai_error or ai_status["status"]}
+
+
+def autosize_worksheet_columns(worksheet):
+    for column_cells in worksheet.columns:
+        max_length = 0
+        column_letter = column_cells[0].column_letter
+        for cell in column_cells:
+            value = "" if cell.value is None else str(cell.value)
+            max_length = max(max_length, len(value))
+        worksheet.column_dimensions[column_letter].width = min(max(max_length + 2, 12), 40)
+
+
+EXCEL_MONTH_GENITIVE_NAMES = {
+    1: "sausio",
+    2: "vasario",
+    3: "kovo",
+    4: "balandžio",
+    5: "gegužės",
+    6: "birželio",
+    7: "liepos",
+    8: "rugpjūčio",
+    9: "rugsėjo",
+    10: "spalio",
+    11: "lapkričio",
+    12: "gruodžio",
+}
+EXCEL_WEEKDAY_LETTERS = ["P", "A", "T", "K", "P", "Š", "S"]
+PREFERRED_WORKER_FILL_COLORS = {
+    "lukas": "8FE3EA",
+    "benas": "B7D7A8",
+    "liepa": "C9B6F2",
+    "deividas": "F5A623",
+    "goda": "F7D982",
+    "samanta": "F4B183",
+}
+FALLBACK_WORKER_FILL_COLORS = [
+    "9FC5E8",
+    "B6D7A8",
+    "FFE599",
+    "D9D2E9",
+    "F9CB9C",
+    "A2C4C9",
+    "D5A6BD",
+    "CFE2F3",
+]
+EMPTY_SHIFT_FILL_COLOR = "B00000"
+DATE_FILL_COLOR = "F2F2F2"
+WHITE_FILL_COLOR = "FFFFFF"
+HEADER_FILL_COLOR = "173D34"
+EXPORT_FONT_NAME = "Arial"
+THIN_BLACK_BORDER = Border(
+    left=Side(style="thin", color="000000"),
+    right=Side(style="thin", color="000000"),
+    top=Side(style="thin", color="000000"),
+    bottom=Side(style="thin", color="000000"),
+)
+
+
+def get_export_date_label(schedule_settings, day_number):
+    month_name = EXCEL_MONTH_GENITIVE_NAMES.get(schedule_settings["month"], MONTH_NAMES[schedule_settings["month"]].lower())
+    return f"{month_name} {day_number}"
+
+
+def get_export_weekday_letter(schedule_settings, day_number):
+    weekday_index = calendar.weekday(schedule_settings["year"], schedule_settings["month"], day_number)
+    return EXCEL_WEEKDAY_LETTERS[weekday_index]
+
+
+def collect_export_worker_names(generated_schedule, worker_summary):
+    names = []
+    for day in generated_schedule:
+        for assignment in day.get("assignments", []):
+            worker_name = assignment.get("worker_name")
+            if worker_name and worker_name not in names:
+                names.append(worker_name)
+    for worker in worker_summary:
+        worker_name = worker.get("name")
+        if worker_name and worker_name not in names:
+            names.append(worker_name)
+    return names
+
+
+def build_export_worker_color_map(generated_schedule, worker_summary):
+    worker_colors = {}
+    fallback_index = 0
+    for worker_name in collect_export_worker_names(generated_schedule, worker_summary):
+        preferred_color = PREFERRED_WORKER_FILL_COLORS.get(normalize_text(worker_name))
+        if preferred_color:
+            worker_colors[worker_name] = preferred_color
+        else:
+            worker_colors[worker_name] = FALLBACK_WORKER_FILL_COLORS[fallback_index % len(FALLBACK_WORKER_FILL_COLORS)]
+            fallback_index += 1
+    return worker_colors
+
+
+def get_export_shift_column_count(generated_schedule):
+    max_assignments = max((len(day.get("assignments", [])) for day in generated_schedule), default=0)
+    return max(2, min(5, max_assignments))
+
+
+def format_export_assignment(assignment):
+    worker_name = assignment.get("worker_name")
+    shift_time = assignment.get("shift_time", "")
+    return f"{worker_name} {shift_time}".strip() if worker_name else shift_time or "-"
+
+
+def style_export_cell(cell, fill_color=WHITE_FILL_COLOR, bold=False, font_color="000000"):
+    cell.fill = PatternFill("solid", fgColor=fill_color)
+    cell.font = Font(name=EXPORT_FONT_NAME, bold=bold, color=font_color, size=10)
+    cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=False)
+    cell.border = THIN_BLACK_BORDER
+
+
+def create_warning_sheet(workbook, schedule_settings, generated_schedule):
+    warning_rows = [day for day in generated_schedule if day.get("warnings")]
+    if not warning_rows:
+        return
+
+    warning_sheet = workbook.create_sheet("Ispejimai")
+    headers = ["Data", "Ispejimai"]
+    for column_index, header in enumerate(headers, start=1):
+        cell = warning_sheet.cell(row=1, column=column_index, value=header)
+        cell.fill = PatternFill("solid", fgColor=HEADER_FILL_COLOR)
+        cell.font = Font(name=EXPORT_FONT_NAME, color="FFFFFF", bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+
+    for row_index, day in enumerate(warning_rows, start=2):
+        date_cell = warning_sheet.cell(row=row_index, column=1, value=get_export_date_label(schedule_settings, day["day"]))
+        warning_cell = warning_sheet.cell(row=row_index, column=2, value="\n".join(day["warnings"]))
+        date_cell.font = Font(name=EXPORT_FONT_NAME, size=10)
+        warning_cell.font = Font(name=EXPORT_FONT_NAME, size=10)
+        warning_cell.alignment = Alignment(wrap_text=True, vertical="top")
+    autosize_worksheet_columns(warning_sheet)
+
+
+def create_schedule_workbook(location_name, schedule_settings, generated_schedule, worker_summary):
+    workbook = Workbook()
+    schedule_sheet = workbook.active
+    schedule_sheet.title = "Grafikas"
+    schedule_sheet.sheet_view.showGridLines = False
+
+    worker_colors = build_export_worker_color_map(generated_schedule, worker_summary)
+    shift_column_count = get_export_shift_column_count(generated_schedule)
+
+    for row_index, day in enumerate(generated_schedule, start=1):
+        row_values = [
+            day.get("demand_label", ""),
+            get_export_weekday_letter(schedule_settings, day["day"]),
+            get_export_date_label(schedule_settings, day["day"]),
+        ]
+        assignments = day.get("assignments", [])[:shift_column_count]
+        row_values.extend(format_export_assignment(assignment) for assignment in assignments)
+        while len(row_values) < 3 + shift_column_count:
+            row_values.append("")
+
+        for column_index, value in enumerate(row_values, start=1):
+            cell = schedule_sheet.cell(row=row_index, column=column_index, value=value)
+            if column_index <= 2:
+                style_export_cell(cell, WHITE_FILL_COLOR, bold=True)
+            elif column_index == 3:
+                style_export_cell(cell, DATE_FILL_COLOR)
+            else:
+                assignment_index = column_index - 4
+                assignment = assignments[assignment_index] if assignment_index < len(assignments) else None
+                if assignment and assignment.get("worker_name"):
+                    style_export_cell(cell, worker_colors.get(assignment["worker_name"], FALLBACK_WORKER_FILL_COLORS[0]))
+                elif assignment:
+                    style_export_cell(cell, EMPTY_SHIFT_FILL_COLOR, font_color="FFFFFF")
+                else:
+                    style_export_cell(cell, WHITE_FILL_COLOR)
+        schedule_sheet.row_dimensions[row_index].height = 18
+
+    schedule_sheet.column_dimensions["A"].width = 4
+    schedule_sheet.column_dimensions["B"].width = 4
+    schedule_sheet.column_dimensions["C"].width = 15
+    for column_index in range(4, 4 + shift_column_count):
+        schedule_sheet.column_dimensions[get_column_letter(column_index)].width = 22
+    schedule_sheet.freeze_panes = "D1"
+    schedule_sheet.page_setup.orientation = "landscape"
+    schedule_sheet.page_setup.fitToWidth = 1
+
+    create_warning_sheet(workbook, schedule_settings, generated_schedule)
+
+    header_fill = PatternFill("solid", fgColor=HEADER_FILL_COLOR)
+    header_font = Font(name=EXPORT_FONT_NAME, color="FFFFFF", bold=True)
+
+    summary_sheet = workbook.create_sheet("Suvestine")
+    summary_headers = ["Vardas", "Etatas", "Pamainu sk.", "Dirbtos valandos", "Reikalingos valandos", "Skirtumas", "Savaitgaliai", "Uzdarymai"]
+    for column_index, header in enumerate(summary_headers, start=1):
+        cell = summary_sheet.cell(row=1, column=column_index, value=header)
+        cell.fill = header_fill
+        cell.font = header_font
+    for row_index, item in enumerate(worker_summary, start=2):
+        row_values = [
+            item["name"],
+            item["etatas"],
+            item["assigned_shifts"],
+            item["assigned_hours"],
+            item["target_hours"],
+            item["hours_difference"],
+            item["weekend_days"],
+            item["closing_shifts"],
+        ]
+        for column_index, value in enumerate(row_values, start=1):
+            summary_sheet.cell(row=row_index, column=column_index, value=value).font = Font(name=EXPORT_FONT_NAME, size=10)
+    autosize_worksheet_columns(summary_sheet)
+
+    return workbook
+
+
+def build_export_filename(location, settings):
+    safe_location = re.sub(r"[^a-z0-9-]+", "-", normalize_text(location["name"])).strip("-") or "grafikas"
+    return f"{safe_location}-{settings['year']}-{settings['month']:02d}.xlsx"
+
+
+def save_schedule_export(location):
+    workbook = create_schedule_workbook(
+        location["name"],
+        location["schedule_settings"],
+        location["generated_schedule"],
+        location["worker_summary"] or [],
+    )
+    filename = build_export_filename(location, location["schedule_settings"])
+    export_path = EXPORTS_DIR / filename
+    workbook.save(export_path)
+    return export_path
+
+
+def get_location_rule_overview(location_id):
+    rule = get_location_rule(location_id)
+    overview = []
+    for weekday_index, day_rules in enumerate(rule["days"]):
+        full_shifts, half_shifts = split_template_shifts(day_rules)
+        overview.append({
+            "weekday_name": DAY_LONG_NAMES[weekday_index],
+            "full_shifts_text": ", ".join(f"{shift['start']}-{shift['end']} ({shift['hours']:g}h)" for shift in full_shifts) or "-",
+            "half_shift_text": ", ".join(f"{shift['start']}-{shift['end']} ({shift['hours']:g}h)" for shift in half_shifts) or "-",
+            "default_demand": format_demand_value(len(full_shifts) + (0.5 if half_shifts else 0.0)),
+            "breaks_text": ", ".join(day_rules["breaks"]) if day_rules["breaks"] else "-",
         })
+    return {"name": rule["name"], "notes": rule["notes"], "days": overview}
 
-    worker_summary = sorted(
-        worker_summary,
-        key=lambda w: (-float(w["etatas"]), w["name"].lower())
+
+def get_location_tabs(active_location_id):
+    return [{"id": config["id"], "name": app_data["locations"][config["id"]]["name"], "active": config["id"] == active_location_id} for config in LOCATION_CONFIGS]
+
+
+def get_location(location_id):
+    if location_id not in app_data["locations"]:
+        location_id = DEFAULT_LOCATION_ID
+    return location_id, app_data["locations"][location_id]
+
+
+def get_worker_or_404(location, worker_id):
+    worker = next((item for item in location["workers"] if item["id"] == worker_id), None)
+    if worker is None:
+        abort(404)
+    return worker
+
+
+def get_requested_location_id():
+    return request.form.get("location_id") or request.args.get("location") or DEFAULT_LOCATION_ID
+
+
+def clear_generated_results(location):
+    location["generated_schedule"] = []
+    location["worker_summary"] = None
+    location["schedule_insights"] = None
+
+
+def get_demand_context(location, location_id):
+    settings = location["schedule_settings"]
+    return parse_daily_demand_map(location["demand_raw"], settings["year"], settings["month"], location_id)
+
+
+def build_workers_for_view(location, location_id):
+    settings = location["schedule_settings"]
+    expected_days = get_days_in_month(settings["year"], settings["month"])
+    demand_map, _ = get_demand_context(location, location_id)
+    workers = []
+    for worker in location["workers"]:
+        worker_runtime = build_worker_runtime(worker, settings, location_id, demand_map)
+        worker_runtime["status"] = get_worker_status(
+            worker_runtime["day_count"],
+            expected_days,
+            worker_runtime["filled_day_count"],
+        )
+        workers.append(worker_runtime)
+    return sort_workers_for_display(workers)
+
+
+def build_dashboard_stats(location, workers, demand_rows):
+    total_requested_hours = sum(row["requested_hours"] for row in demand_rows)
+    total_workers = len(workers)
+    total_entered_lines = sum(worker["filled_day_count"] for worker in workers)
+    expected_total_lines = len(demand_rows) * total_workers
+    incomplete_workers = [
+        {
+            "name": worker["name"],
+            "missing_days": max(0, len(demand_rows) - worker["filled_day_count"]),
+            "extra_lines": max(0, worker["day_count"] - len(demand_rows)),
+        }
+        for worker in workers
+        if worker["filled_day_count"] != len(demand_rows) or worker["day_count"] > len(demand_rows)
+    ]
+    stats = {
+        "total_workers": total_workers,
+        "total_requested_hours": total_requested_hours,
+        "entered_lines": total_entered_lines,
+        "expected_lines": expected_total_lines,
+        "incomplete_workers": incomplete_workers,
+        "is_ready": bool(workers) and not incomplete_workers,
+        "uncovered_shifts": 0,
+        "warning_days": 0,
+        "assigned_hours": 0,
+    }
+
+    if location["generated_schedule"]:
+        uncovered_shifts = 0
+        warning_days = 0
+        for day in location["generated_schedule"]:
+            uncovered_shifts += sum(1 for assignment in day["assignments"] if not assignment["worker_name"])
+            if day["warnings"]:
+                warning_days += 1
+        stats["uncovered_shifts"] = uncovered_shifts
+        stats["warning_days"] = warning_days
+
+    if location["worker_summary"]:
+        stats["assigned_hours"] = round(sum(item["assigned_hours"] for item in location["worker_summary"]), 1)
+
+    return stats
+
+
+def render_home_page(location_id):
+    location_id, location = get_location(location_id)
+    settings = location["schedule_settings"]
+    expected_days = get_days_in_month(settings["year"], settings["month"])
+    _, demand_rows = get_demand_context(location, location_id)
+    workers = build_workers_for_view(location, location_id)
+    return render_template(
+        "index.html",
+        locations=get_location_tabs(location_id),
+        current_location=location,
+        current_location_id=location_id,
+        workers=workers,
+        selected_month=settings["month"],
+        selected_year=settings["year"],
+        expected_days=expected_days,
+        month_name=MONTH_NAMES[settings["month"]],
+        location_rule=get_location_rule_overview(location_id),
+        demand_rows=demand_rows,
+        default_demand_raw=build_default_demand_raw(location_id, settings["year"], settings["month"]),
+        dashboard_stats=build_dashboard_stats(location, workers, demand_rows),
+        build_number=BUILD_NUMBER,
+        generated_schedule=location["generated_schedule"],
+        worker_summary=location["worker_summary"],
+        schedule_insights=location["schedule_insights"],
+        ai_status=get_ai_status(),
     )
 
-    return worker_summary
+
+def render_settings_page(location_id):
+    location_id, location = get_location(location_id)
+    settings = location["schedule_settings"]
+    expected_days = get_days_in_month(settings["year"], settings["month"])
+    _, demand_rows = get_demand_context(location, location_id)
+    return render_template(
+        "settings.html",
+        locations=get_location_tabs(location_id),
+        current_location=location,
+        current_location_id=location_id,
+        selected_month=settings["month"],
+        selected_year=settings["year"],
+        expected_days=expected_days,
+        month_name=MONTH_NAMES[settings["month"]],
+        demand_rows=demand_rows,
+        default_demand_raw=build_default_demand_raw(location_id, settings["year"], settings["month"]),
+        build_number=BUILD_NUMBER,
+    )
+
+
+def render_info_page(location_id):
+    location_id, location = get_location(location_id)
+    return render_template(
+        "info.html",
+        locations=get_location_tabs(location_id),
+        current_location=location,
+        current_location_id=location_id,
+        build_number=BUILD_NUMBER,
+    )
 
 
 @app.route("/")
 def home():
-    year = schedule_settings["year"]
-    month = schedule_settings["month"]
-    expected_days = get_days_in_month(year, month)
+    return render_home_page(get_requested_location_id())
 
-    workers_with_status = []
-    for worker in workers:
-        worker_copy = worker.copy()
-        worker_copy["status"] = get_worker_status(worker["day_count"], expected_days)
-        workers_with_status.append(worker_copy)
 
-    workers_with_status = sort_workers_for_display(workers_with_status)
+@app.route("/settings")
+def settings_page():
+    return render_settings_page(get_requested_location_id())
 
+
+@app.route("/info")
+def info_page():
+    return render_info_page(get_requested_location_id())
+
+
+@app.route("/worker/<worker_id>/edit")
+def edit_worker_page(worker_id):
+    location_id, location = get_location(get_requested_location_id())
+    worker = get_worker_or_404(location, worker_id)
     return render_template(
-        "index.html",
-        workers=workers_with_status,
-        selected_month=month,
-        selected_year=year,
-        expected_days=expected_days,
-        settings=schedule_settings,
-        generated_schedule=generated_schedule,
-        worker_summary=None
+        "edit_worker.html",
+        worker=worker,
+        locations=get_location_tabs(location_id),
+        current_location=location,
+        current_location_id=location_id,
+        expected_days=get_days_in_month(
+            location["schedule_settings"]["year"],
+            location["schedule_settings"]["month"],
+        ),
+        build_number=BUILD_NUMBER,
     )
 
 
 @app.route("/save_settings", methods=["POST"])
 def save_settings():
+    location_id, location = get_location(get_requested_location_id())
     month = request.form.get("month", "").strip()
     year = request.form.get("year", "").strip()
-
-    try:
-        month = int(month)
-        year = int(year)
-
-        if 1 <= month <= 12 and 2000 <= year <= 2100:
-            schedule_settings["month"] = month
-            schedule_settings["year"] = year
-            rebuild_all_workers()
-    except ValueError:
-        pass
-
-    return redirect(url_for("home"))
+    full_time_hours = request.form.get("full_time_hours", "").strip()
+    current_settings = location["schedule_settings"]
+    location["schedule_settings"]["month"] = sanitize_int(month, current_settings["month"], 1, 12)
+    location["schedule_settings"]["year"] = sanitize_int(year, current_settings["year"], 2000, 2100)
+    location["schedule_settings"]["full_time_hours"] = sanitize_int(
+        full_time_hours,
+        current_settings["full_time_hours"],
+        1,
+        250,
+    )
+    location["demand_raw"] = sanitize_demand_raw(request.form.get("demand_raw", ""), location_id, location["schedule_settings"])
+    clear_generated_results(location)
+    save_app_data()
+    return redirect(url_for("home", location=location_id))
 
 
 @app.route("/add_worker", methods=["POST"])
 def add_worker():
+    location_id, location = get_location(get_requested_location_id())
     name = request.form.get("name", "").strip()
     etatas = request.form.get("etatas", "").strip()
     availability_raw = request.form.get("availability", "").strip()
-
-    availability_lines = parse_availability_lines(availability_raw)
-    parsed_availability = parse_worker_availability(
-        availability_lines,
-        schedule_settings["year"],
-        schedule_settings["month"]
-    )
-
     if name and etatas:
-        workers.append({
-            "name": name,
-            "etatas": etatas,
-            "availability_raw": availability_raw,
-            "availability_lines": availability_lines,
-            "parsed_availability": parsed_availability,
-            "day_count": len(availability_lines)
-        })
-
-    return redirect(url_for("home"))
+        location["workers"].append({"id": uuid4().hex, "name": name, "etatas": etatas, "availability_raw": availability_raw})
+        clear_generated_results(location)
+        save_app_data()
+    return redirect(url_for("home", location=location_id))
 
 
-@app.route("/delete_worker/<int:index>", methods=["POST"])
-def delete_worker(index):
-    sorted_workers = sort_workers_for_display(workers)
+@app.route("/delete_worker/<worker_id>", methods=["POST"])
+def delete_worker(worker_id):
+    location_id, location = get_location(get_requested_location_id())
+    original_count = len(location["workers"])
+    location["workers"] = [worker for worker in location["workers"] if worker["id"] != worker_id]
+    if len(location["workers"]) != original_count:
+        clear_generated_results(location)
+        save_app_data()
+    return redirect(url_for("home", location=location_id))
 
-    if 0 <= index < len(sorted_workers):
-        target_worker = sorted_workers[index]
-        for real_index, worker in enumerate(workers):
-            if worker is target_worker:
-                workers.pop(real_index)
-                break
 
-    return redirect(url_for("home"))
+@app.route("/worker/<worker_id>/update", methods=["POST"])
+def update_worker(worker_id):
+    location_id, location = get_location(get_requested_location_id())
+    worker = get_worker_or_404(location, worker_id)
+    name = request.form.get("name", "").strip()
+    etatas = request.form.get("etatas", "").strip()
+    availability_raw = request.form.get("availability", "").strip("\r\n")
+    if name and etatas:
+        worker.update({"name": name, "etatas": etatas, "availability_raw": availability_raw})
+        clear_generated_results(location)
+        save_app_data()
+    return redirect(url_for("home", location=location_id, _anchor="workers"))
 
 
 @app.route("/generate_schedule", methods=["POST"])
 def generate_schedule_route():
-    year = schedule_settings["year"]
-    month = schedule_settings["month"]
-    expected_days = get_days_in_month(year, month)
+    location_id, location = get_location(get_requested_location_id())
+    demand_map, _ = get_demand_context(location, location_id)
+    workers = build_workers_for_view(location, location_id)
+    generated_schedule, worker_summary = generate_month_schedule(workers, location["schedule_settings"], location_id, demand_map)
+    location["generated_schedule"] = generated_schedule
+    location["worker_summary"] = worker_summary
+    location["schedule_insights"] = build_schedule_insights(location, generated_schedule, worker_summary)
+    save_app_data()
+    return redirect(url_for("home", location=location_id))
 
-    workers_with_status = []
-    for worker in workers:
-        worker_copy = worker.copy()
-        worker_copy["status"] = get_worker_status(worker["day_count"], expected_days)
-        workers_with_status.append(worker_copy)
 
-    workers_with_status = sort_workers_for_display(workers_with_status)
+@app.route("/export_schedule")
+def export_schedule():
+    location_id, location = get_location(get_requested_location_id())
+    if not location["generated_schedule"]:
+        abort(404)
 
-    worker_summary = generate_month_schedule()
-
-    return render_template(
-        "index.html",
-        workers=workers_with_status,
-        selected_month=month,
-        selected_year=year,
-        expected_days=expected_days,
-        settings=schedule_settings,
-        generated_schedule=generated_schedule,
-        worker_summary=worker_summary
+    export_path = save_schedule_export(location)
+    return send_file(
+        export_path,
+        as_attachment=True,
+        download_name=export_path.name,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(
+        host=os.getenv("HOST", "127.0.0.1"),
+        port=sanitize_int(os.getenv("PORT"), 5000, 1, 65535),
+        debug=os.getenv("FLASK_DEBUG") == "1",
+    )

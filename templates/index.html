@@ -1,373 +1,328 @@
+﻿
 <!DOCTYPE html>
 <html lang="lt">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Dėdės Luko puikusis grafiko dėliotojas 3000</title>
+    <title>Workforce Scheduler</title>
     <style>
-        body {
-            font-family: Arial, sans-serif;
-            max-width: 1500px;
-            margin: 40px auto;
-            padding: 20px;
-            background: #f5f5f5;
-            color: #222;
-        }
-
-        h1, h2, h3 {
-            color: #222;
-        }
-
-        .box {
-            background: white;
-            padding: 20px;
-            border-radius: 14px;
-            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
-            margin-bottom: 25px;
-        }
-
-        form {
+        html { scroll-behavior: smooth; }
+        :root { --bg:#f5f5f5; --panel:#fff; --text:#222; --muted:#666; --border:#ddd; --ok:#067647; --warn:#b42318; --accent:#222; --info:#0b63b6; }
+        body[data-theme="dark"] { --bg:#101514; --panel:#17201e; --text:#eef4f2; --muted:#9fb0aa; --border:#2a3935; --accent:#eef4f2; --info:#7db7ff; }
+        body { font-family:"Segoe UI", Arial, sans-serif; max-width:1580px; margin:32px auto; padding:20px; background:var(--bg); color:var(--text); }
+        h1, h2, h3 { margin-top:0; }
+        .main-title { font-size:34px; margin-bottom:4px; }
+        .subtitle { margin-top:0; color:var(--muted); }
+        .tabs { display:flex; flex-wrap:wrap; gap:10px; margin:24px 0; }
+        .edge-hotspot { position:fixed; left:0; top:0; width:22px; height:100vh; z-index:70; }
+        .side-panel {
+            position: fixed;
+            left: 0;
+            top: 0;
+            width: 260px;
+            height: 100vh;
+            box-sizing: border-box;
+            background: linear-gradient(180deg, #173d34, #0c241f);
+            color: #f4f7f6;
+            box-shadow: 8px 0 24px rgba(0, 0, 0, 0.18);
+            transform: translateX(-100%);
+            transition: transform 0.22s ease;
+            z-index: 80;
             display: flex;
             flex-direction: column;
-            gap: 12px;
+            padding: 18px 18px 16px;
         }
-
-        .row {
-            display: flex;
-            gap: 12px;
-            flex-wrap: wrap;
-            align-items: center;
+        .side-panel.open { transform: translateX(0); }
+        .side-title { font-size: 22px; font-weight: 800; margin-bottom: 4px; }
+        .side-subtitle { font-size: 13px; color: rgba(244, 247, 246, 0.72); margin-bottom: 22px; }
+        .side-links { display: flex; flex-direction: column; gap: 10px; }
+        .side-link {
+            color: #f4f7f6;
+            text-decoration: none;
+            background: rgba(255, 255, 255, 0.08);
+            border: 1px solid rgba(255, 255, 255, 0.08);
+            border-radius: 12px;
+            padding: 12px 14px;
+            font-weight: 700;
         }
-
-        input, select, textarea, button {
-            padding: 12px;
-            font-size: 16px;
-            border-radius: 10px;
-            border: 1px solid #ccc;
-        }
-
-        textarea {
-            min-height: 220px;
-            resize: vertical;
-            font-family: inherit;
-        }
-
-        button {
-            cursor: pointer;
-            border: none;
-            background: #222;
-            color: white;
-            width: fit-content;
-            padding-left: 18px;
-            padding-right: 18px;
-        }
-
-        button:hover {
-            opacity: 0.92;
-        }
-
-        .delete-btn {
-            background: #b42318;
-        }
-
-        .generate-btn {
-            background: #067647;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            margin-top: 15px;
-            background: white;
-        }
-
-        th, td {
-            padding: 12px;
-            border-bottom: 1px solid #ddd;
-            text-align: left;
-            vertical-align: top;
-        }
-
-        th {
-            background: #eee;
-        }
-
-        .small-text {
-            color: #666;
-            font-size: 14px;
-            line-height: 1.5;
-        }
-
-        .count-badge {
-            display: inline-block;
-            padding: 6px 10px;
-            border-radius: 999px;
-            background: #efefef;
-            font-size: 14px;
-            font-weight: bold;
-        }
-
-        .status-ok {
-            color: #067647;
-            font-weight: bold;
-        }
-
-        .status-bad {
-            color: #b42318;
-            font-weight: bold;
-        }
-
-        .worker-day-box {
-            max-height: 260px;
-            overflow-y: auto;
-            background: #fafafa;
-            border: 1px solid #e6e6e6;
-            padding: 10px;
-            border-radius: 10px;
-        }
-
-        .parsed-line {
-            margin-bottom: 10px;
-            padding: 10px;
-            border-radius: 8px;
-            background: #ffffff;
-            border: 1px solid #ececec;
-        }
-
-        .fit-badge {
-            display: inline-block;
-            padding: 4px 8px;
-            margin-right: 6px;
-            margin-top: 6px;
-            border-radius: 999px;
+        .side-link:hover { background: rgba(255, 255, 255, 0.14); }
+        .side-info {
+            margin-top: 18px;
+            padding: 14px;
+            border-radius: 12px;
+            background: rgba(255, 255, 255, 0.08);
             font-size: 13px;
-            font-weight: bold;
+            line-height: 1.5;
+            color: rgba(244, 247, 246, 0.88);
         }
-
-        .ok-badge {
-            background: #d1fadf;
-            color: #067647;
+        .side-footer {
+            margin-top: auto;
+            padding-top: 16px;
+            border-top: 1px solid rgba(255,255,255,0.14);
+            font-size: 13px;
+            font-weight: 800;
+            color: rgba(244, 247, 246, 0.94);
+            text-align: right;
         }
-
-        .no-badge {
-            background: #fee4e2;
-            color: #b42318;
-        }
-
-        .warning-list {
-            margin: 8px 0 0 0;
-            padding-left: 18px;
-            color: #b42318;
-        }
-
-        .schedule-table th,
-        .schedule-table td {
-            text-align: center;
-        }
-
-        .weekday-cell {
-            font-weight: bold;
-            white-space: nowrap;
-        }
-
-        .shift-slot {
-            min-width: 180px;
-        }
-
-        .muted {
-            color: #888;
-        }
-
-        .main-title {
-            font-size: 34px;
-            margin-bottom: 4px;
-        }
-
-        .subtitle {
-            margin-top: 0;
-            color: #666;
-        }
+        .tab-link { display:inline-block; text-decoration:none; padding:10px 16px; border-radius:999px; background:#e9e9e9; color:var(--text); font-weight:600; }
+        .tab-link.active { background:var(--accent); color:#fff; }
+        .box { background:var(--panel); padding:20px; border-radius:14px; box-shadow:0 2px 12px rgba(0,0,0,.08); margin-bottom:24px; overflow-x:auto; }
+        .info-box { border-left:5px solid var(--ok); }
+        .grid-2 { display:grid; grid-template-columns:1.4fr 1fr; gap:18px; }
+        .stats-grid { display:grid; grid-template-columns:repeat(4, minmax(0, 1fr)); gap:14px; margin-bottom:24px; }
+        .stat-card { background:linear-gradient(180deg, #fff, #f7f7f7); border:1px solid #ececec; border-radius:14px; padding:16px; }
+        .stat-label { color:var(--muted); font-size:13px; margin-bottom:6px; }
+        .stat-value { font-size:28px; font-weight:800; }
+        .quick-nav { display:flex; flex-wrap:wrap; gap:10px; margin:16px 0 24px; }
+        .quick-nav a { text-decoration:none; color:var(--text); background:#ececec; padding:8px 12px; border-radius:999px; font-weight:600; }
+        .section-anchor { scroll-margin-top: 16px; }
+        form { display:flex; flex-direction:column; gap:12px; }
+        .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+        .row.spread { justify-content:space-between; }
+        input, select, textarea, button { padding:12px; font-size:15px; border-radius:10px; border:1px solid #ccc; }
+        textarea { min-height:220px; resize:vertical; font-family:inherit; }
+        .demand-textarea { min-height:320px; }
+        button { cursor:pointer; border:none; background:var(--accent); color:#fff; width:fit-content; padding-left:18px; padding-right:18px; }
+        .secondary-btn { background:#ececec; color:var(--text); border:1px solid #d8d8d8; }
+        .delete-btn { background:var(--warn); }
+        .generate-btn { background:var(--ok); }
+        .action-row { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+        .action-row form { margin:0; }
+        .edit-link { display:inline-block; text-decoration:none; padding:10px 12px; border-radius:10px; background:#e8f1ff; color:#174ea6; font-weight:700; }
+        table { width:100%; border-collapse:collapse; margin-top:15px; background:var(--panel); }
+        th, td { padding:12px; border-bottom:1px solid var(--border); text-align:left; vertical-align:top; }
+        th { background:#eee; }
+        .small-text { color:var(--muted); font-size:14px; line-height:1.5; }
+        .count-badge, .badge { display:inline-block; padding:6px 10px; border-radius:999px; background:#efefef; font-size:13px; font-weight:700; }
+        .badge-ok { background:#d1fadf; color:var(--ok); }
+        .badge-warn { background:#fee4e2; color:var(--warn); }
+        .badge-info { background:#dbeafe; color:var(--info); }
+        .status-ok { color:var(--ok); font-weight:700; }
+        .status-bad { color:var(--warn); font-weight:700; }
+        .worker-day-box { max-height:320px; overflow-y:auto; background:#fafafa; border:1px solid #e6e6e6; padding:10px; border-radius:10px; }
+        .parsed-line { margin-bottom:10px; padding:10px; border-radius:8px; background:#fff; border:1px solid #ececec; }
+        .parsed-summary { cursor:pointer; font-weight:700; }
+        details[open] .parsed-summary { margin-bottom:8px; }
+        .fit-badge { display:inline-block; padding:4px 8px; margin-right:6px; margin-top:6px; border-radius:999px; font-size:12px; font-weight:700; }
+        .ok-badge { background:#d1fadf; color:var(--ok); }
+        .no-badge { background:#fee4e2; color:var(--warn); }
+        .warning-list, .note-list, .insight-list { margin:8px 0 0 18px; padding-left:0; }
+        .warning-list li { margin-bottom:6px; }
+        .warning-critical { color: var(--warn); font-weight:700; }
+        .warning-fixed { color: var(--info); font-weight:700; }
+        .warning-closed { color: var(--muted); font-weight:700; }
+        .schedule-table th, .schedule-table td { text-align:center; }
+        .weekday-cell { font-weight:700; white-space:nowrap; }
+        .shift-slot { min-width:180px; }
+        .muted { color:#888; }
+        .location-title { display:flex; flex-wrap:wrap; gap:10px; align-items:baseline; margin-bottom:8px; }
+        .location-chip { display:inline-block; padding:6px 12px; border-radius:999px; background:#ececec; font-weight:600; }
+        .warning-row { background:#fff7f6; }
+        .readiness { margin:12px 0 16px; padding:14px 16px; border-left:5px solid var(--ok); background:#ecfdf3; color:#064e3b; }
+        .readiness.warning { border-left-color:var(--warn); background:#fff4f2; color:#7a271a; }
+        body[data-theme="dark"] .readiness { background:#123229; color:#d1fadf; }
+        body[data-theme="dark"] .readiness.warning { background:#3b1d1a; color:#fee4e2; }
+        .readiness ul { margin:8px 0 0 18px; padding:0; }
+        .search-input { max-width:320px; width:100%; }
+        .scroll-top-btn { position:fixed; right:24px; bottom:24px; width:56px; height:56px; border-radius:999px; border:1px solid rgba(255,255,255,.35); background:linear-gradient(135deg,#222,#067647); color:#fff; box-shadow:0 12px 30px rgba(34,34,34,.22); font-size:24px; font-weight:700; display:flex; align-items:center; justify-content:center; opacity:0; visibility:hidden; transform:translateY(18px) scale(.92); transition:opacity .25s ease, transform .25s ease, visibility .25s ease; z-index:50; }
+        .scroll-top-btn.visible { opacity:1; visibility:visible; transform:translateY(0) scale(1); }
+        @media (max-width:1100px) { .grid-2, .stats-grid { grid-template-columns:1fr; } }
     </style>
 </head>
 <body>
-    <h1 class="main-title">Dėdės Luko puikusis grafiko dėliotojas 3000</h1>
-    <p class="subtitle">Automatinis darbuotojų grafiko generatorius</p>
+    <div class="edge-hotspot" id="edgeHotspot" aria-hidden="true"></div>
+    <aside class="side-panel" id="sidePanel">
+        <div class="side-title">Workforce Scheduler</div>
+        <div class="side-subtitle">Greita sonine navigacija</div>
+        <nav class="side-links">
+            <a class="side-link" href="{{ url_for('home', location=current_location_id) }}">Pagrindinis</a>
+            <a class="side-link" href="{{ url_for('settings_page', location=current_location_id) }}">Nustatymai</a>
+            <a class="side-link" href="{{ url_for('info_page', location=current_location_id) }}">Info</a>
+        </nav>
+        <div class="side-info">
+            Sis meniu atsidaro tik priartinus pele prie kairio ekrano krasto.
+        </div>
+        <div class="side-footer">
+            Build {{ build_number }}
+        </div>
+    </aside>
 
-    <div class="box">
-        <h2>Grafiko nustatymai</h2>
-        <form action="/save_settings" method="POST">
-            <div class="row">
-                <label for="month"><strong>Mėnuo:</strong></label>
-                <select name="month" id="month" required>
-                    <option value="1" {% if selected_month == 1 %}selected{% endif %}>Sausis</option>
-                    <option value="2" {% if selected_month == 2 %}selected{% endif %}>Vasaris</option>
-                    <option value="3" {% if selected_month == 3 %}selected{% endif %}>Kovas</option>
-                    <option value="4" {% if selected_month == 4 %}selected{% endif %}>Balandis</option>
-                    <option value="5" {% if selected_month == 5 %}selected{% endif %}>Gegužė</option>
-                    <option value="6" {% if selected_month == 6 %}selected{% endif %}>Birželis</option>
-                    <option value="7" {% if selected_month == 7 %}selected{% endif %}>Liepa</option>
-                    <option value="8" {% if selected_month == 8 %}selected{% endif %}>Rugpjūtis</option>
-                    <option value="9" {% if selected_month == 9 %}selected{% endif %}>Rugsėjis</option>
-                    <option value="10" {% if selected_month == 10 %}selected{% endif %}>Spalis</option>
-                    <option value="11" {% if selected_month == 11 %}selected{% endif %}>Lapkritis</option>
-                    <option value="12" {% if selected_month == 12 %}selected{% endif %}>Gruodis</option>
-                </select>
+    <h1 class="main-title">Workforce Scheduler</h1>
+    <p class="subtitle">Lietuvisko prieinamumo analize, kruvio balansavimas ir Excel eksportas.</p>
 
-                <label for="year"><strong>Metai:</strong></label>
-                <input type="number" name="year" id="year" value="{{ selected_year }}" min="2000" max="2100" required>
+    <div class="tabs">
+        {% for location in locations %}
+            <a class="tab-link {% if location.active %}active{% endif %}" href="{{ url_for('home', location=location.id) }}">{{ location.name }}</a>
+        {% endfor %}
+    </div>
 
-                <button type="submit">Išsaugoti nustatymus</button>
-            </div>
-        </form>
+    <div class="box info-box">
+        <div class="location-title">
+            <h2>Aktyvi lokacija</h2>
+            <span class="location-chip">{{ current_location.name }}</span>
+            <span class="badge badge-ok">{{ ai_status.status }}</span>
+        </div>
+        <p class="small-text">Kairio stulpelio skaicius dabar valdo poreiki: `2` = 2 pilnos, `1,5` = 1 pilna + 1 puse, `0,5` = puse pamainos. Jei poreikis virsija sablona, papildoma pamaina rodoma kaip `Pilna+`.</p>
+    </div>
 
-        <p class="small-text">
-            Šiam mėnesiui reikia <strong>{{ expected_days }}</strong> dienų įrašų kiekvienam darbuotojui.
-        </p>
-
-        <p class="small-text">
-            <strong>Pr–Kt:</strong> 10:00–18:30, 13:00–21:30<br>
-            <strong>Pn–Sk:</strong> 10:00–18:30, 13:00–21:30, 15:00–21:30
-        </p>
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-label">Darbuotojai</div>
+            <div class="stat-value">{{ dashboard_stats.total_workers }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Poreikio valandos</div>
+            <div class="stat-value">{{ dashboard_stats.total_requested_hours }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Uzpildytos dienos</div>
+            <div class="stat-value">{{ dashboard_stats.entered_lines }} / {{ dashboard_stats.expected_lines }}</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-label">Neuzdengtos pamainos</div>
+            <div class="stat-value">{{ dashboard_stats.uncovered_shifts }}</div>
+        </div>
     </div>
 
     <div class="box">
-        <h2>Pridėti darbuotoją</h2>
-        <form action="/add_worker" method="POST">
-            <input type="text" name="name" placeholder="Darbuotojo vardas" required>
+        <h2>{{ current_location.name }} taisykles</h2>
+        <p class="small-text">Naudojamas sablonas: <strong>{{ location_rule.name }}</strong></p>
+        {% if location_rule.notes %}
+            <ul class="note-list small-text">{% for note in location_rule.notes %}<li>{{ note }}</li>{% endfor %}</ul>
+        {% endif %}
+        <table>
+            <thead><tr><th>Diena</th><th>Pilnos pamainos</th><th>Pusine pamaina</th><th>Numatytas poreikis</th><th>Pertraukos</th></tr></thead>
+            <tbody>
+                {% for rule_day in location_rule.days %}
+                <tr>
+                    <td><strong>{{ rule_day.weekday_name }}</strong></td>
+                    <td>{{ rule_day.full_shifts_text }}</td>
+                    <td>{{ rule_day.half_shift_text }}</td>
+                    <td>{{ rule_day.default_demand }}</td>
+                    <td>{{ rule_day.breaks_text }}</td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
 
+    <div class="box section-anchor" id="workers">
+        <h2>Prideti darbuotoja i {{ current_location.name }}</h2>
+        <form action="{{ url_for('add_worker') }}" method="POST">
+            <input type="hidden" name="location_id" value="{{ current_location_id }}">
+            <input type="text" name="name" placeholder="Darbuotojo vardas" required>
             <select name="etatas" required>
-                <option value="">Pasirink etatą</option>
+                <option value="">Pasirink etata</option>
                 <option value="0.25">0.25</option>
                 <option value="0.5">0.5</option>
                 <option value="0.75">0.75</option>
                 <option value="1.0">1.0</option>
             </select>
+            <label for="availability"><strong>Menesio galimumas</strong></label>
+            <div class="small-text">Viena eilute = viena diena. Pirma bando taisykles, o jei tekstas neaiskus ir ijungtas AI, tada kvieciamas AI parseris.</div>
+            <textarea name="availability" id="availability" placeholder="Pvz.: galiu / nuo 14 / iki 17 / 10-18 / nezinau"></textarea>
+            <button type="submit">Prideti darbuotoja</button>
+        </form>
+    </div>
 
-            <label for="availability"><strong>Mėnesio galimumas</strong></label>
-            <div class="small-text">
-                Įklijuok tiesiai iš Excel.<br>
-                <strong>Viena eilutė = viena diena.</strong>
+    <div class="box">
+        <h2>Sugeneruoti {{ current_location.name }} menesio grafika</h2>
+        {% if dashboard_stats.is_ready %}
+            <div class="readiness"><strong>Duomenys paruošti.</strong> Visi darbuotojai turi po {{ expected_days }} užpildytų dienų.</div>
+        {% elif not workers %}
+            <div class="readiness warning"><strong>Nėra darbuotojų.</strong> Pridėk bent vieną darbuotoją prieš generuojant.</div>
+        {% else %}
+            <div class="readiness warning">
+                <strong>Bus generuojamas dalinis grafikas.</strong> Trūkstamos dienos laikomos neprieinamomis, todėl gali atsirasti daug neuždengtų pamainų.
+                <ul>
+                    {% for worker in dashboard_stats.incomplete_workers %}
+                        <li>{{ worker.name }}: {% if worker.missing_days %}trūksta {{ worker.missing_days }} d.{% endif %}{% if worker.missing_days and worker.extra_lines %}, {% endif %}{% if worker.extra_lines %}per daug {{ worker.extra_lines }} eil.{% endif %}</li>
+                    {% endfor %}
+                </ul>
             </div>
-
-            <textarea
-                name="availability"
-                id="availability"
-                placeholder="Įklijuok vieną Excel stulpelį čia..."
-            ></textarea>
-
-            <button type="submit">Pridėti darbuotoją</button>
+        {% endif %}
+        <form action="{{ url_for('generate_schedule_route') }}" method="POST">
+            <input type="hidden" name="location_id" value="{{ current_location_id }}">
+            <button type="submit" class="generate-btn">Sugeneruoti grafika</button>
         </form>
     </div>
 
     <div class="box">
-        <h2>Sugeneruoti mėnesio grafiką</h2>
-        <form action="/generate_schedule" method="POST">
-            <button type="submit" class="generate-btn">Sugeneruoti grafiką</button>
-        </form>
-    </div>
-
-    <div class="box">
-        <h2>Darbuotojai</h2>
-
+        <h2>{{ current_location.name }} darbuotojai</h2>
         {% if workers %}
+            <div class="row spread">
+                <div class="small-text">Greita paieska padeda filtruoti pagal varda.</div>
+                <input class="search-input" type="search" id="workerSearchInput" placeholder="Filtruoti darbuotojus pagal varda">
+            </div>
             <table>
-                <thead>
-                    <tr>
-                        <th>Vardas</th>
-                        <th>Etatas</th>
-                        <th>Įrašai</th>
-                        <th>Statusas</th>
-                        <th>Atpažinta informacija pagal dieną</th>
-                        <th>Veiksmas</th>
-                    </tr>
-                </thead>
+                <thead><tr><th>Vardas</th><th>Etatas</th><th>Irasai</th><th>Statusas</th><th>Atpazinta pagal diena</th><th>Veiksmas</th></tr></thead>
                 <tbody>
                     {% for worker in workers %}
-                    <tr>
+                    <tr data-worker-row data-worker-name="{{ worker.name|lower }}">
                         <td>{{ worker.name }}</td>
                         <td>{{ worker.etatas }}</td>
-                        <td><span class="count-badge">{{ worker.day_count }} / {{ expected_days }}</span></td>
+                        <td><span class="count-badge">{{ worker.filled_day_count }} / {{ expected_days }}</span></td>
+                        <td>{% if worker.status == "Gerai" %}<span class="status-ok">{{ worker.status }}</span>{% else %}<span class="status-bad">{{ worker.status }}</span>{% endif %}</td>
                         <td>
-                            {% if worker.status == "Gerai" %}
-                                <span class="status-ok">{{ worker.status }}</span>
-                            {% else %}
-                                <span class="status-bad">{{ worker.status }}</span>
-                            {% endif %}
-                        </td>
-                        <td>
-                            <div class="worker-day-box">
+                            <details class="worker-day-box">
+                                <summary class="parsed-summary">Rodyti dienu detales</summary>
                                 {% for item in worker.parsed_availability %}
                                     <div class="parsed-line">
-                                        <div><strong>{{ item.day }} {{ item.weekday_name }}</strong> — {{ item.original }}</div>
+                                        <div><strong>{{ item.day }} {{ item.weekday_name }}</strong> {% if item.has_input %}- {{ item.original or "(be teksto)" }}{% else %}- <span class="muted">nera ivesto iraso</span>{% endif %}</div>
                                         <div class="small-text">{{ item.parsed_text }}</div>
-
+                                        <div class="small-text">
+                                            {% if item.parser_source == "ai" %}<span class="badge badge-info">AI parseris</span>{% else %}<span class="badge">Taisykliu parseris</span>{% endif %}
+                                            {% if item.confidence %}<span class="badge">tikimybe {{ '%.2f'|format(item.confidence) }}</span>{% endif %}
+                                        </div>
                                         {% for fit in item.shift_fit %}
-                                            {% if fit.ok %}
-                                                <span class="fit-badge ok-badge">{{ fit.assigned_start }}-{{ fit.assigned_end }} ✓</span>
-                                            {% else %}
-                                                <span class="fit-badge no-badge">{{ fit.start }}-{{ fit.end }} ✗</span>
-                                            {% endif %}
+                                            {% if fit.ok %}<span class="fit-badge ok-badge">{{ fit.label }} {{ fit.assigned_start }}-{{ fit.assigned_end }}</span>{% else %}<span class="fit-badge no-badge">{{ fit.label }} {{ fit.start }}-{{ fit.end }}</span>{% endif %}
                                         {% endfor %}
+                                        {% if item.ai_notes %}<div class="small-text muted">{{ item.ai_notes }}</div>{% endif %}
                                     </div>
                                 {% endfor %}
-                            </div>
+                            </details>
                         </td>
                         <td>
-                            <form action="/delete_worker/{{ loop.index0 }}" method="POST">
-                                <button type="submit" class="delete-btn">Ištrinti</button>
-                            </form>
+                            <div class="action-row">
+                                <a class="edit-link" href="{{ url_for('edit_worker_page', worker_id=worker.id, location=current_location_id) }}">Redaguoti</a>
+                                <form action="{{ url_for('delete_worker', worker_id=worker.id) }}" method="POST">
+                                    <input type="hidden" name="location_id" value="{{ current_location_id }}">
+                                    <button type="submit" class="delete-btn">Istrinti</button>
+                                </form>
+                            </div>
                         </td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
         {% else %}
-            <p>Dar nėra pridėtų darbuotojų.</p>
+            <p>Sioje lokacijoje dar nera pridetu darbuotoju.</p>
         {% endif %}
     </div>
 
     {% if generated_schedule %}
-    <div class="box">
-        <h2>Sugeneruotas grafikas</h2>
+    <div class="box section-anchor" id="schedule">
+        <div class="row spread">
+            <h2>{{ current_location.name }} sugeneruotas grafikas</h2>
+            <a class="tab-link" href="{{ url_for('export_schedule', location=current_location_id) }}">Atsisiusti Excel</a>
+        </div>
         <table class="schedule-table">
-            <thead>
-                <tr>
-                    <th>Diena</th>
-                    <th>Savaitės diena</th>
-                    <th class="shift-slot">Pamaina 1</th>
-                    <th class="shift-slot">Pamaina 2</th>
-                    <th class="shift-slot">Pamaina 3</th>
-                    <th>Įspėjimai</th>
-                </tr>
-            </thead>
+            <thead><tr><th>Diena</th><th>Sav. d.</th><th>Poreikis</th><th class="shift-slot">Pamaina 1</th><th class="shift-slot">Pamaina 2</th><th class="shift-slot">Pamaina 3</th><th class="shift-slot">Pamaina 4</th><th class="shift-slot">Pamaina 5</th><th>Ispejimai</th></tr></thead>
             <tbody>
                 {% for day in generated_schedule %}
-                <tr>
+                <tr class="{% if day.warnings %}warning-row{% endif %}">
                     <td>{{ day.day }}</td>
                     <td class="weekday-cell">{{ day.weekday_name }}</td>
-
+                    <td><span class="count-badge">{{ day.demand_label }}</span></td>
                     {% for assignment in day.assignments %}
-                        <td class="shift-slot">
-                            <strong>{{ assignment.shift_time }}</strong><br>
-                            {% if assignment.worker_name %}
-                                {{ assignment.worker_name }}
-                            {% else %}
-                                <span class="muted">-</span>
-                            {% endif %}
-                        </td>
+                        <td class="shift-slot"><strong>{{ assignment.slot_kind }}</strong><br>{{ assignment.shift_time }}<br>{% if assignment.worker_name %}{{ assignment.worker_name }}{% else %}<span class="muted">-</span>{% endif %}</td>
                     {% endfor %}
-
-                    {% if day.assignments|length < 3 %}
-                        {% for _ in range(3 - day.assignments|length) %}
-                            <td class="shift-slot"><span class="muted">-</span></td>
-                        {% endfor %}
-                    {% endif %}
-
+                    {% if day.assignments|length < 5 %}{% for _ in range(5 - day.assignments|length) %}<td class="shift-slot"><span class="muted">-</span></td>{% endfor %}{% endif %}
                     <td>
                         {% if day.warnings %}
                             <ul class="warning-list">
                                 {% for warning in day.warnings %}
-                                    <li>{{ warning }}</li>
+                                    <li class="{% if 'Tarpas uzdengtas' in warning %}warning-fixed{% elif 'Lokacija nedirba' in warning %}warning-closed{% elif 'Nera darbuotojo' in warning or 'tuscia' in warning %}warning-critical{% endif %}">{{ warning }}</li>
                                 {% endfor %}
                             </ul>
                         {% else %}
@@ -382,33 +337,74 @@
     {% endif %}
 
     {% if worker_summary %}
-    <div class="box">
-        <h2>Krūvio suvestinė</h2>
+    <div class="box section-anchor" id="summary">
+        <h2>{{ current_location.name }} kruvio suvestine</h2>
         <table>
-            <thead>
-                <tr>
-                    <th>Vardas</th>
-                    <th>Etatas</th>
-                    <th>Pamainų sk.</th>
-                    <th>Dirbtos valandos</th>
-                    <th>Reikalingos valandos</th>
-                    <th>Skirtumas</th>
-                </tr>
-            </thead>
+            <thead><tr><th>Vardas</th><th>Etatas</th><th>Pamainu sk.</th><th>Dirbtos valandos</th><th>Reikalingos valandos</th><th>Skirtumas</th><th>Savaitgaliai</th><th>Uzdarymai</th></tr></thead>
             <tbody>
                 {% for item in worker_summary %}
-                <tr>
-                    <td>{{ item.name }}</td>
-                    <td>{{ item.etatas }}</td>
-                    <td>{{ item.assigned_shifts }}</td>
-                    <td>{{ item.assigned_hours }}</td>
-                    <td>{{ item.target_hours }}</td>
-                    <td>{{ item.hours_difference }}</td>
-                </tr>
+                <tr><td>{{ item.name }}</td><td>{{ item.etatas }}</td><td>{{ item.assigned_shifts }}</td><td>{{ item.assigned_hours }}</td><td>{{ item.target_hours }}</td><td>{{ item.hours_difference }}</td><td>{{ item.weekend_days }}</td><td>{{ item.closing_shifts }}</td></tr>
                 {% endfor %}
             </tbody>
         </table>
     </div>
     {% endif %}
+
+    {% if schedule_insights %}
+    <div class="box section-anchor" id="insights">
+        <h2>Pasiulymai</h2>
+        <p class="small-text">{% if schedule_insights.ai_used %}Taisykliu isvados + AI pasiulymai.{% else %}Taisykliu isvados.{% endif %}</p>
+        <ul class="insight-list">{% for item in schedule_insights["items"] %}<li>{{ item }}</li>{% endfor %}</ul>
+    </div>
+    {% endif %}
+
+    <button type="button" class="scroll-top-btn" id="scrollTopBtn" aria-label="Grizti i puslapio virsu" title="I virsu">↑</button>
+    <script>
+        const storedTheme = localStorage.getItem("theme");
+        if (storedTheme) {
+            document.body.setAttribute("data-theme", storedTheme);
+        }
+        const scrollTopBtn = document.getElementById("scrollTopBtn");
+        const sidePanel = document.getElementById("sidePanel");
+        const edgeHotspot = document.getElementById("edgeHotspot");
+        const workerSearchInput = document.getElementById("workerSearchInput");
+        function updateScrollTopButton() { if (window.scrollY > 320) { scrollTopBtn.classList.add("visible"); } else { scrollTopBtn.classList.remove("visible"); } }
+        scrollTopBtn.addEventListener("click", function () { window.scrollTo({ top: 0, behavior: "smooth" }); });
+        window.addEventListener("scroll", updateScrollTopButton, { passive: true });
+        updateScrollTopButton();
+
+        function openSidePanel() {
+            sidePanel.classList.add("open");
+        }
+
+        function closeSidePanel() {
+            sidePanel.classList.remove("open");
+        }
+
+        document.addEventListener("mousemove", function (event) {
+            if (event.clientX <= 18) {
+                openSidePanel();
+            } else if (!sidePanel.matches(":hover") && event.clientX > 300) {
+                closeSidePanel();
+            }
+        });
+
+        edgeHotspot.addEventListener("mouseenter", openSidePanel);
+        sidePanel.addEventListener("mouseleave", function (event) {
+            if (event.clientX > 300) {
+                closeSidePanel();
+            }
+        });
+
+        if (workerSearchInput) {
+            workerSearchInput.addEventListener("input", function () {
+                const query = workerSearchInput.value.trim().toLowerCase();
+                document.querySelectorAll("[data-worker-row]").forEach(function (row) {
+                    const name = row.getAttribute("data-worker-name") || "";
+                    row.style.display = !query || name.includes(query) ? "" : "none";
+                });
+            });
+        }
+    </script>
 </body>
 </html>

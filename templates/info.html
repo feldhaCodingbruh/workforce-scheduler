@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="lt">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Info | Workforce Scheduler</title>
+    <style>
+        :root { --bg:#f5f5f5; --panel:#fff; --text:#222; --muted:#666; --border:#ddd; --accent:#222; }
+        body[data-theme="dark"] { --bg:#101514; --panel:#17201e; --text:#eef4f2; --muted:#9fb0aa; --border:#2a3935; --accent:#eef4f2; }
+        body { font-family:"Segoe UI", Arial, sans-serif; max-width:1200px; margin:32px auto; padding:20px; background:var(--bg); color:var(--text); }
+        .edge-hotspot { position:fixed; left:0; top:0; width:22px; height:100vh; z-index:70; }
+        .side-panel { position:fixed; left:0; top:0; width:260px; height:100vh; box-sizing:border-box; background:linear-gradient(180deg,#173d34,#0c241f); color:#f4f7f6; box-shadow:8px 0 24px rgba(0,0,0,.18); transform:translateX(-100%); transition:transform .22s ease; z-index:80; display:flex; flex-direction:column; padding:18px 18px 16px; }
+        .side-panel.open { transform:translateX(0); }
+        .side-title { font-size:22px; font-weight:800; margin-bottom:4px; }
+        .side-subtitle { font-size:13px; color:rgba(244,247,246,.72); margin-bottom:22px; }
+        .side-links { display:flex; flex-direction:column; gap:10px; }
+        .side-link { color:#f4f7f6; text-decoration:none; background:rgba(255,255,255,.08); border:1px solid rgba(255,255,255,.08); border-radius:12px; padding:12px 14px; font-weight:700; }
+        .side-link:hover { background:rgba(255,255,255,.14); }
+        .side-footer { margin-top:auto; padding-top:16px; border-top:1px solid rgba(255,255,255,.14); font-size:13px; font-weight:800; color:rgba(244,247,246,.94); text-align:right; }
+        .box { background:var(--panel); padding:24px; border-radius:16px; border:1px solid var(--border); }
+        .lead { color:var(--muted); line-height:1.6; }
+    </style>
+</head>
+<body>
+    <div class="edge-hotspot" id="edgeHotspot" aria-hidden="true"></div>
+    <aside class="side-panel" id="sidePanel">
+        <div class="side-title">Workforce Scheduler</div>
+        <div class="side-subtitle">Greita sonine navigacija</div>
+        <nav class="side-links">
+            <a class="side-link" href="{{ url_for('home', location=current_location_id) }}">Pagrindinis</a>
+            <a class="side-link" href="{{ url_for('settings_page', location=current_location_id) }}">Nustatymai</a>
+            <a class="side-link" href="{{ url_for('info_page', location=current_location_id) }}">Info</a>
+        </nav>
+        <div class="side-footer">Build {{ build_number }}</div>
+    </aside>
+
+    <h1>Info</h1>
+    <p class="lead">Trumpa informacija apie svetaine ir jos ideja.</p>
+
+    <div class="box">
+        <h2>Svetainės ideja</h2>
+        <p class="lead">Si svetaine sukurta tam, kad darbuotoju grafiko deliojimas butu greitesnis, aiskesnis ir maziau varginantis. Ji padeda is dienos poreikio ir darbuotoju galimumu sugeneruoti pradine grafiko versija, parodyti trukumus, isskirti konfliktus ir palengvinti rankini pataisyma.</p>
+        <h2>Kuo ji gali padeti kitiems</h2>
+        <p class="lead">Toks irankis gali padeti parduotuvems, kavinems, sezoniniams taskams ar kitoms nedidelems komandoms, kurios kas menesi ranka delioja pamainas. Jis taupo laika, padeda matyti valandu balansa, savaitgalius, uzdarymus ir mazina klaidu tikimybe.</p>
+        <h2>Kurejas</h2>
+        <p class="lead"><strong>Lukas Mikalainis</strong> yra sios svetainės kurejas.</p>
+    </div>
+
+    <script>
+        const storedTheme = localStorage.getItem("theme");
+        if (storedTheme) {
+            document.body.setAttribute("data-theme", storedTheme);
+        }
+        const sidePanel = document.getElementById("sidePanel");
+        const edgeHotspot = document.getElementById("edgeHotspot");
+        function openSidePanel() { sidePanel.classList.add("open"); }
+        function closeSidePanel() { sidePanel.classList.remove("open"); }
+        document.addEventListener("mousemove", function (event) {
+            if (event.clientX <= 18) { openSidePanel(); }
+            else if (!sidePanel.matches(":hover") && event.clientX > 300) { closeSidePanel(); }
+        });
+        edgeHotspot.addEventListener("mouseenter", openSidePanel);
+        sidePanel.addEventListener("mouseleave", function (event) {
+            if (event.clientX > 300) { closeSidePanel(); }
+        });
+    </script>
+</body>
+</html>
