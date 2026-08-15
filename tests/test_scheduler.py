@@ -309,6 +309,21 @@ class ManualTimeAndImportTests(unittest.TestCase):
 
         self.assertEqual(updated[0]["assignments"][0]["shift_time"], "13:30-21:30")
 
+    def test_import_expands_single_digit_minutes_as_tens(self):
+        workers = [{"id": "worker-c", "name": "Worker C"}]
+
+        assignment, invalid, unknown = app.parse_import_assignment_cell(
+            "Worker C 16:30-21:3",
+            workers,
+            2,
+        )
+
+        self.assertEqual(assignment["shift_time"], "16:30-21:30")
+        self.assertEqual(assignment["worker_id"], "worker-c")
+        self.assertEqual(assignment["worker_name"], "Worker C")
+        self.assertFalse(invalid)
+        self.assertFalse(unknown)
+
     def test_import_keeps_exact_times_and_infers_them_for_later_blank_day(self):
         location_id = app.DEFAULT_LOCATION_ID
         location_name = app.LOCATION_CONFIGS[0]["name"]

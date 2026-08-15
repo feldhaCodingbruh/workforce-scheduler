@@ -27,7 +27,7 @@ DEFAULT_MONTH = 3
 DEFAULT_YEAR = 2026
 DEFAULT_FULL_TIME_HOURS = 160
 RULES_VERSION = 6
-BUILD_NUMBER = "0.7.1"
+BUILD_NUMBER = "0.7.2"
 DEFAULT_AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 FULL_SHIFT_MIN_HOURS = 7.0
 HALF_SHIFT_HOURS = 4.0
@@ -163,6 +163,7 @@ def is_valid_time(time_str):
 TIME_RANGE_PATTERN = r"(?<![\d:.])(\d{1,2})(?:[:.](\d{2}))?\s*[-\u2013\u2014]\s*(\d{1,2})(?:[:.](\d{2}))?(?![\d:.])"
 TIME_RANGE_SEARCH_RE = re.compile(TIME_RANGE_PATTERN)
 TIME_RANGE_FULL_RE = re.compile(rf"\s*{TIME_RANGE_PATTERN}\s*")
+IMPORT_SINGLE_DIGIT_MINUTE_RE = re.compile(r"(?<![\d:.])(\d{1,2})([:.])([0-5])(?!\d)")
 
 
 def interval_from_match(match):
@@ -174,6 +175,13 @@ def interval_from_match(match):
     if time_to_minutes(start_time) >= time_to_minutes(end_time):
         return None
     return start_time, end_time
+
+
+def expand_import_single_digit_minutes(text):
+    return IMPORT_SINGLE_DIGIT_MINUTE_RE.sub(
+        lambda match: f"{match.group(1)}{match.group(2)}{match.group(3)}0",
+        text,
+    )
 
 
 def time_to_minutes(time_str):
@@ -1458,12 +1466,13 @@ def parse_import_assignment_cell(value, workers, slot_index):
     text = str(value or "").strip()
     if not text or text in {"-", "–", "—"}:
         return None, False, False
-    match = TIME_RANGE_SEARCH_RE.search(text)
+    normalized_text = expand_import_single_digit_minutes(text)
+    match = TIME_RANGE_SEARCH_RE.search(normalized_text)
     interval = interval_from_match(match) if match else None
     if not interval:
         return None, True, False
 
-    candidate_name = re.sub(r"\s+", " ", text[:match.start()].strip(" -–—"))
+    candidate_name = re.sub(r"\s+", " ", normalized_text[:match.start()].strip(" -–—"))
     worker = resolve_import_worker(candidate_name, workers) if candidate_name else None
     hours = shift_length_hours(interval[0], interval[1])
     assignment = {
