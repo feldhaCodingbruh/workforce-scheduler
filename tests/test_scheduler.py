@@ -1,6 +1,10 @@
 import unittest
 from copy import deepcopy
+from datetime import datetime
+from io import BytesIO
 from unittest.mock import patch
+
+from openpyxl import Workbook
 
 import app
 
@@ -276,6 +280,92 @@ class ScheduleRegressionTests(unittest.TestCase):
         self.assertEqual(schedule[0]["assignments"][0]["worker_name"], None)
 
 
+class ManualTimeAndImportTests(unittest.TestCase):
+    def test_schedule_form_accepts_flexible_custom_time(self):
+        schedule = [{
+            "day": 1,
+            "assignments": [{
+                "shift_time": "13:00-21:30",
+                "worker_id": None,
+                "worker_name": None,
+            }],
+        }]
+
+        updated = app.apply_schedule_form_assignments(
+            schedule,
+            [],
+            {"assignment_time_1_0": "13.30 \u2013 21.30"},
+        )
+
+        self.assertEqual(updated[0]["assignments"][0]["shift_time"], "13:30-21:30")
+
+    def test_import_keeps_exact_times_and_infers_them_for_later_blank_day(self):
+        location_id = app.DEFAULT_LOCATION_ID
+        location_name = app.LOCATION_CONFIGS[0]["name"]
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        workers = [
+            {"id": "a", "name": "Worker A", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
+            {"id": "b", "name": "Worker B", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
+            {"id": "c", "name": "Worker C", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
+        ]
+        location = {
+            "name": location_name,
+            "schedule_settings": settings,
+            "demand_raw": "\n".join(["0"] * 30),
+            "workers": workers,
+        }
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = location_name
+        sheet.append([
+            2.5,
+            "P",
+            datetime(2026, 6, 1),
+            "Worker A 10:00-18:30",
+            "Worker B 13:30-21:30",
+            "Worker C 14:00-21:30",
+        ])
+        sheet.append([2.5, "P", datetime(2026, 6, 8), None, None, None])
+        file_buffer = BytesIO()
+        workbook.save(file_buffer)
+
+        imported = app.read_partial_schedule_upload(
+            file_buffer.getvalue(),
+            "partial.xlsx",
+            "",
+            location,
+            location_id,
+        )
+
+        self.assertEqual(imported["sheet_name"], location_name)
+        self.assertEqual(imported["assigned_count"], 3)
+        self.assertEqual(imported["inferred_time_count"], 3)
+        self.assertEqual(
+            [item["shift_time"] for item in imported["schedule"][1]["assignments"]],
+            ["10:00-18:30", "13:30-21:30", "14:00-21:30"],
+        )
+
+        demand = {day: (2.5 if day in {1, 8} else 0.0) for day in range(1, 31)}
+        runtime_workers = [
+            app.build_worker_runtime(worker, settings, location_id, demand)
+            for worker in workers
+        ]
+        completed, _ = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            location_id,
+            demand,
+            existing_schedule=imported["schedule"],
+            fill_open_slots=True,
+        )
+
+        self.assertEqual(
+            [item["shift_time"] for item in completed[7]["assignments"]],
+            ["10:00-18:30", "13:30-21:30", "14:00-21:30"],
+        )
+        self.assertTrue(all(item["worker_name"] for item in completed[7]["assignments"]))
+
+
 class WorkerEditingTests(unittest.TestCase):
     def setUp(self):
         self.location = app.app_data["locations"]["location-a"]
@@ -363,6 +453,42 @@ class PartialScheduleRouteTests(unittest.TestCase):
         self.assertEqual(day_one["assignments"][1]["worker_name"], "Worker B")
         self.assertEqual(response.headers["Location"], "/?location=location-a#schedule")
 
+    def test_import_route_loads_partial_workbook_without_completing_it(self):
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = self.location["name"]
+        sheet.append([
+            2,
+            "P",
+            datetime(2026, 6, 1),
+            "Worker A 10:00-18:30",
+            "13:30-21:30",
+        ])
+        file_buffer = BytesIO()
+        workbook.save(file_buffer)
+        client = app.app.test_client()
+
+        with patch.object(app, "save_app_data"), patch.object(
+            app,
+            "build_schedule_insights",
+            return_value={"items": [], "ai_used": False, "ai_status": ""},
+        ):
+            response = client.post(
+                "/import_partial_schedule",
+                data={
+                    "location_id": "location-a",
+                    "schedule_file": (BytesIO(file_buffer.getvalue()), "partial.xlsx"),
+                },
+                content_type="multipart/form-data",
+            )
+
+        self.assertEqual(response.status_code, 302)
+        day_one = self.location["generated_schedule"][0]
+        self.assertEqual(day_one["assignments"][0]["worker_name"], "Worker A")
+        self.assertEqual(day_one["assignments"][1]["worker_name"], None)
+        self.assertEqual(day_one["assignments"][1]["shift_time"], "13:30-21:30")
+        self.assertIn("import_status=ok", response.headers["Location"])
+
     def test_partial_schedule_editor_renders_worker_selects_and_actions(self):
         client = app.app.test_client()
 
@@ -371,6 +497,8 @@ class PartialScheduleRouteTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn('name="assignment_1_0"', html)
+        self.assertIn('name="assignment_time_1_0"', html)
+        self.assertIn('name="schedule_file"', html)
         self.assertIn("Išsaugoti dalį", html)
         self.assertIn("Užbaigti grafiką", html)
 

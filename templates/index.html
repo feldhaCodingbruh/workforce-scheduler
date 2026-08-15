@@ -115,8 +115,14 @@
         .schedule-table th:last-child, .schedule-table td:last-child { min-width:300px; text-align:left; }
         .weekday-cell { font-weight:700; white-space:nowrap; }
         .shift-slot { min-width:180px; }
+        .shift-time-input { width:100%; min-width:160px; box-sizing:border-box; margin-top:7px; padding:9px 10px; text-align:center; font-weight:700; }
         .shift-worker-select { width:100%; min-width:160px; margin-top:8px; padding:9px 10px; }
         .schedule-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:4px; }
+        .schedule-import { border-top:1px solid var(--border); margin-top:18px; padding-top:18px; }
+        .import-form .row { align-items:flex-end; }
+        .import-field { display:flex; flex-direction:column; gap:6px; min-width:240px; font-weight:700; }
+        .import-field input { font-weight:400; }
+        .import-notice { margin:0 0 14px; }
         .complete-btn { background:var(--info); }
         .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
         .muted { color:#888; }
@@ -253,6 +259,24 @@
                 <button type="submit" name="mode" value="draft" class="secondary-btn">Sukurti tuščią ruošinį</button>
             </div>
         </form>
+        <div class="schedule-import section-anchor" id="schedule-import">
+            <h3>Įkelti pradėtą grafiką</h3>
+            {% if import_notice %}
+                <div class="readiness import-notice{% if import_notice.kind == 'error' %} warning{% endif %}">{{ import_notice.text }}</div>
+            {% endif %}
+            <form class="import-form" action="{{ url_for('import_partial_schedule_route') }}" method="POST" enctype="multipart/form-data">
+                <input type="hidden" name="location_id" value="{{ current_location_id }}">
+                <div class="row">
+                    <label class="import-field">Excel arba CSV
+                        <input type="file" name="schedule_file" accept=".xlsx,.csv" required>
+                    </label>
+                    <label class="import-field">Lapo pavadinimas (nebūtina)
+                        <input type="text" name="sheet_name" placeholder="{{ current_location.name }}">
+                    </label>
+                    <button type="submit" class="secondary-btn">Įkelti dalį</button>
+                </div>
+            </form>
+        </div>
     </div>
 
     <div class="box">
@@ -334,13 +358,19 @@
                         {% for assignment in day.assignments %}
                             <td class="shift-slot">
                                 <strong>{{ assignment.slot_kind }}</strong><br>
-                                {{ assignment.shift_time }}
+                                <label class="visually-hidden" for="assignment_time_{{ day.day }}_{{ loop.index0 }}">{{ day.day }} dienos {{ assignment.shift_label }} laikas</label>
+                                <input class="shift-time-input" id="assignment_time_{{ day.day }}_{{ loop.index0 }}" name="assignment_time_{{ day.day }}_{{ loop.index0 }}" value="{{ assignment.shift_time }}" inputmode="numeric" required>
                                 <label class="visually-hidden" for="assignment_{{ day.day }}_{{ loop.index0 }}">{{ day.day }} dienos {{ assignment.shift_label }} darbuotojas</label>
                                 <select class="shift-worker-select" id="assignment_{{ day.day }}_{{ loop.index0 }}" name="assignment_{{ day.day }}_{{ loop.index0 }}">
                                     <option value="" {% if not assignment.worker_name and not assignment.worker_id %}selected{% endif %}>Nepriskirta</option>
+                                    {% set worker_match = namespace(found=false) %}
                                     {% for worker in workers %}
+                                        {% if assignment.worker_id == worker.id or (not assignment.worker_id and assignment.worker_name == worker.name) %}{% set worker_match.found = true %}{% endif %}
                                         <option value="{{ worker.id }}" {% if assignment.worker_id == worker.id or (not assignment.worker_id and assignment.worker_name == worker.name) %}selected{% endif %}>{{ worker.name }}</option>
                                     {% endfor %}
+                                    {% if (assignment.worker_name or assignment.worker_id) and not worker_match.found %}
+                                        <option value="__preserve__" selected>Nerastas: {{ assignment.worker_name or assignment.worker_id }}</option>
+                                    {% endif %}
                                 </select>
                             </td>
                         {% endfor %}

@@ -23,6 +23,9 @@ adding repeatable scheduling rules and visible warnings.
 - Full, partial, and template-override shifts when demand exceeds the base plan.
 - Coverage, minimum-rest, consecutive-day, and workload-balance checks.
 - Editable schedule drafts that preserve manual assignments and fill only open shifts.
+- XLSX/CSV partial-schedule import that keeps exact shift times and carries recent
+  same-slot timing into later blank days.
+- Per-shift time editing before saving or completing a draft.
 - Employee editing and incomplete-input warnings.
 - Compact Excel schedule export with warnings and employee summaries.
 - Optional OpenAI-assisted schedule suggestions when `OPENAI_API_KEY` is set.
@@ -91,8 +94,8 @@ python -m unittest discover -s tests -v
 ```
 
 The regression suite covers availability parsing, blank calendar positions,
-template overrides, configurable FTE targets, partial availability, worker
-editing, and Excel export formatting.
+template overrides, configurable FTE targets, partial availability, imported
+custom shift times, worker editing, and Excel export formatting.
 
 ## Monthly workflow
 
@@ -100,9 +103,10 @@ editing, and Excel export formatting.
 2. Set daily staffing demand.
 3. Add each employee and paste one availability line per calendar day.
 4. Resolve incomplete-input warnings or intentionally continue with partial data.
-5. Generate the schedule, or create an empty draft and assign part of it manually.
-6. Save the draft or complete only its open shifts, then review coverage and workload warnings.
-7. Export the manager-ready Excel workbook.
+5. Generate a schedule, create an empty draft, or upload a partially completed XLSX/CSV file.
+6. Review assignments and edit any shift time directly in the schedule table.
+7. Save the draft or complete only its open shifts, then review coverage and workload warnings.
+8. Export the manager-ready Excel workbook.
 
 ## Project status
 

@@ -1,7 +1,9 @@
 ﻿
 import calendar
-from datetime import datetime
-from io import BytesIO
+import csv
+from datetime import date, datetime
+from difflib import SequenceMatcher
+from io import BytesIO, StringIO
 import json
 import os
 import re
@@ -13,7 +15,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from flask import Flask, abort, redirect, render_template, request, send_file, url_for
-from openpyxl import Workbook
+from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
@@ -25,7 +27,7 @@ DEFAULT_MONTH = 3
 DEFAULT_YEAR = 2026
 DEFAULT_FULL_TIME_HOURS = 160
 RULES_VERSION = 6
-BUILD_NUMBER = "0.6.0"
+BUILD_NUMBER = "0.7.0"
 DEFAULT_AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 FULL_SHIFT_MIN_HOURS = 7.0
 HALF_SHIFT_HOURS = 4.0
@@ -37,6 +39,10 @@ PREFERRED_REST_HOURS = 13
 SOFT_TURNAROUND_PENALTY_PER_HOUR = 1.0
 ADJACENT_START_TOLERANCE_MINUTES = 60
 ADJACENT_START_BONUS = 0.15
+MAX_IMPORT_BYTES = 5 * 1024 * 1024
+MAX_IMPORT_ROWS = 2000
+MAX_IMPORT_COLUMNS = 20
+MAX_IMPORT_SHIFT_COLUMNS = 5
 
 LOCATION_CONFIGS = [
     {"id": "location-a", "name": "Location A"},
@@ -152,6 +158,22 @@ def is_valid_time(time_str):
     hour = int(match.group(1))
     minute = int(match.group(2))
     return 0 <= hour <= 23 and 0 <= minute <= 59
+
+
+TIME_RANGE_PATTERN = r"(?<![\d:.])(\d{1,2})(?:[:.](\d{2}))?\s*[-\u2013\u2014]\s*(\d{1,2})(?:[:.](\d{2}))?(?![\d:.])"
+TIME_RANGE_SEARCH_RE = re.compile(TIME_RANGE_PATTERN)
+TIME_RANGE_FULL_RE = re.compile(rf"\s*{TIME_RANGE_PATTERN}\s*")
+
+
+def interval_from_match(match):
+    start_hour, start_minute, end_hour, end_minute = match.groups()
+    start_time = f"{int(start_hour):02d}:{int(start_minute or 0):02d}"
+    end_time = f"{int(end_hour):02d}:{int(end_minute or 0):02d}"
+    if not is_valid_time(start_time) or not is_valid_time(end_time):
+        return None
+    if time_to_minutes(start_time) >= time_to_minutes(end_time):
+        return None
+    return start_time, end_time
 
 
 def time_to_minutes(time_str):
@@ -817,15 +839,8 @@ def assignment_time_to_minutes(shift_time):
 
 
 def parse_assignment_interval(shift_time):
-    match = re.fullmatch(r"\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*", str(shift_time or ""))
-    if not match:
-        return None
-    start_time, end_time = match.groups()
-    if not is_valid_time(start_time) or not is_valid_time(end_time):
-        return None
-    if time_to_minutes(start_time) >= time_to_minutes(end_time):
-        return None
-    return start_time, end_time
+    match = TIME_RANGE_FULL_RE.fullmatch(str(shift_time or ""))
+    return interval_from_match(match) if match else None
 
 
 def can_cover_interval(parsed_day, start_time, end_time):
@@ -967,6 +982,21 @@ def build_existing_schedule_map(existing_schedule, days_in_month):
     return existing_by_day
 
 
+def build_effective_template_shift(template_shift, interval, existing_assignment):
+    effective_shift = deepcopy(template_shift)
+    if interval != (template_shift["start"], template_shift["end"]):
+        hours = shift_length_hours(interval[0], interval[1])
+        effective_shift.update({
+            "start": interval[0],
+            "end": interval[1],
+            "hours": hours,
+            "role": "full" if hours >= FULL_SHIFT_MIN_HOURS else "half",
+        })
+    effective_shift["label"] = str(existing_assignment.get("shift_label") or effective_shift["label"])
+    effective_shift["slot_kind"] = str(existing_assignment.get("slot_kind") or effective_shift["slot_kind"])
+    return effective_shift
+
+
 def build_schedule_blueprint(existing_schedule, schedule_settings, location_id, demand_map):
     year, month = schedule_settings["year"], schedule_settings["month"]
     days_in_month = get_days_in_month(year, month)
@@ -998,17 +1028,20 @@ def build_schedule_blueprint(existing_schedule, schedule_settings, location_id, 
                 interval = shift["start"], shift["end"]
                 if existing_assignment.get("worker_name") or existing_assignment.get("worker_id"):
                     append_unique_warning(day_record, f"Rankines pamainos {shift['label']} laikas buvo netinkamas; paliktas sablono laikas.")
+            if existing_assignment.get("time_warning"):
+                append_unique_warning(day_record, str(existing_assignment["time_warning"]))
             worker_name = str(existing_assignment.get("worker_name") or "").strip() or None
             worker_id = str(existing_assignment.get("worker_id") or "").strip() or None
+            effective_shift = build_effective_template_shift(shift, interval, existing_assignment)
             assignments.append({
-                "shift_label": str(existing_assignment.get("shift_label") or shift["label"]),
-                "slot_kind": str(existing_assignment.get("slot_kind") or shift["slot_kind"]),
+                "shift_label": effective_shift["label"],
+                "slot_kind": effective_shift["slot_kind"],
                 "shift_time": f"{interval[0]}-{interval[1]}",
                 "worker_name": worker_name,
                 "worker_id": worker_id,
                 "worker_index": None,
                 "locked": bool(worker_name or worker_id),
-                "template_shift": shift,
+                "template_shift": effective_shift,
             })
 
         for extra_index, existing_assignment in enumerate(existing_assignments[len(shifts):], start=len(shifts) + 1):
@@ -1332,6 +1365,322 @@ EXCEL_MONTH_GENITIVE_NAMES = {
     12: "gruodžio",
 }
 EXCEL_WEEKDAY_LETTERS = ["P", "A", "T", "K", "P", "Š", "S"]
+
+
+class ScheduleImportError(ValueError):
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
+def parse_import_date_value(value, default_year):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return None
+
+    for date_format in ("%Y-%m-%d", "%Y/%m/%d", "%Y.%m.%d", "%d.%m.%Y", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, date_format).date()
+        except ValueError:
+            pass
+
+    normalized = normalize_text(text)
+    for month, month_name in EXCEL_MONTH_GENITIVE_NAMES.items():
+        aliases = {normalize_text(month_name), normalize_text(MONTH_NAMES[month])}
+        for alias in aliases:
+            match = re.fullmatch(rf"{re.escape(alias)}\s+(\d{{1,2}})(?:\s+d\.?)?(?:\s+(\d{{4}}))?", normalized)
+            if not match:
+                continue
+            day_number = int(match.group(1))
+            year = int(match.group(2) or default_year)
+            try:
+                return date(year, month, day_number)
+            except ValueError:
+                return None
+    return None
+
+
+def parse_import_demand_value(value):
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        parsed = float(value)
+    else:
+        text = str(value or "").strip()
+        if not re.fullmatch(r"\d(?:[.,]\d+)?", text):
+            return None
+        parsed = safe_float(text, -1)
+    if not 0 <= parsed <= 5 or abs(parsed * 2 - round(parsed * 2)) > 0.01:
+        return None
+    return round(parsed * 2) / 2
+
+
+def expected_import_slot_count(demand_value):
+    full_count = int(demand_value)
+    return min(MAX_IMPORT_SHIFT_COLUMNS, full_count + (1 if demand_value - full_count >= 0.49 else 0))
+
+
+def resolve_import_worker(candidate_name, workers):
+    normalized_candidate = normalize_text(candidate_name)
+    if not normalized_candidate:
+        return None
+
+    exact_matches = [worker for worker in workers if normalize_text(worker.get("name")) == normalized_candidate]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    mentioned = []
+    for worker in workers:
+        normalized_worker = normalize_text(worker.get("name"))
+        if normalized_worker and re.search(rf"(?<!\w){re.escape(normalized_worker)}(?!\w)", normalized_candidate):
+            mentioned.append(worker)
+    if len(mentioned) == 1:
+        return mentioned[0]
+    if len(mentioned) > 1:
+        return None
+
+    first_token = normalized_candidate.split()[0]
+    first_name_matches = [
+        worker for worker in workers
+        if normalize_text(worker.get("name")).split()[0] == first_token
+    ]
+    return first_name_matches[0] if len(first_name_matches) == 1 else None
+
+
+def parse_import_assignment_cell(value, workers, slot_index):
+    text = str(value or "").strip()
+    if not text or text in {"-", "–", "—"}:
+        return None, False, False
+    match = TIME_RANGE_SEARCH_RE.search(text)
+    interval = interval_from_match(match) if match else None
+    if not interval:
+        return None, True, False
+
+    candidate_name = re.sub(r"\s+", " ", text[:match.start()].strip(" -–—"))
+    worker = resolve_import_worker(candidate_name, workers) if candidate_name else None
+    hours = shift_length_hours(interval[0], interval[1])
+    assignment = {
+        "shift_label": f"Importuota {slot_index + 1}",
+        "slot_kind": "Pilna" if hours >= FULL_SHIFT_MIN_HOURS else "Puse",
+        "shift_time": f"{interval[0]}-{interval[1]}",
+        "worker_id": worker.get("id") if worker else None,
+        "worker_name": worker.get("name") if worker else (candidate_name or None),
+    }
+    return assignment, False, bool(candidate_name and not worker)
+
+
+def find_import_row_date(row, default_year):
+    for column_index, value in enumerate(row[:6]):
+        parsed_date = parse_import_date_value(value, default_year)
+        if parsed_date:
+            return column_index, parsed_date
+    return None, None
+
+
+def find_import_row_demand(row, date_column):
+    for value in row[:date_column]:
+        demand_value = parse_import_demand_value(value)
+        if demand_value is not None:
+            return demand_value
+    return None
+
+
+def infer_blank_import_times(imported_days, year, month):
+    sources = []
+    for day_number, day_data in imported_days.items():
+        weekday_index = calendar.weekday(year, month, day_number)
+        for slot_index, assignment in enumerate(day_data["assignments"]):
+            if not isinstance(assignment, dict):
+                continue
+            interval = parse_assignment_interval(assignment.get("shift_time"))
+            if interval:
+                sources.append((day_number, weekday_index, slot_index, interval))
+
+    inferred_count = 0
+    for day_number, day_data in imported_days.items():
+        weekday_index = calendar.weekday(year, month, day_number)
+        for slot_index, assignment in enumerate(day_data["assignments"]):
+            if isinstance(assignment, dict):
+                continue
+            candidates = [source for source in sources if source[2] == slot_index]
+            if not candidates:
+                continue
+
+            def candidate_key(source):
+                source_day, source_weekday, _, _ = source
+                if source_weekday == weekday_index and source_day <= day_number:
+                    group = 0
+                elif source_weekday == weekday_index:
+                    group = 1
+                elif source_day <= day_number:
+                    group = 2
+                else:
+                    group = 3
+                return group, abs(day_number - source_day), -source_day
+
+            _, _, _, interval = min(candidates, key=candidate_key)
+            hours = shift_length_hours(interval[0], interval[1])
+            day_data["assignments"][slot_index] = {
+                "shift_label": f"Importuota {slot_index + 1}",
+                "slot_kind": "Pilna" if hours >= FULL_SHIFT_MIN_HOURS else "Puse",
+                "shift_time": f"{interval[0]}-{interval[1]}",
+                "worker_id": None,
+                "worker_name": None,
+            }
+            inferred_count += 1
+    return inferred_count
+
+
+def parse_partial_schedule_rows(rows, location, location_id):
+    settings = location["schedule_settings"]
+    year, month = settings["year"], settings["month"]
+    current_demand, _ = get_demand_context(location, location_id)
+    imported_days = {}
+    demand_updates = {}
+    warning_count = 0
+    unknown_worker_count = 0
+    assigned_count = 0
+
+    for row in rows[:MAX_IMPORT_ROWS]:
+        values = list(row[:MAX_IMPORT_COLUMNS])
+        date_column, row_date = find_import_row_date(values, year)
+        if not row_date or row_date.year != year or row_date.month != month:
+            continue
+
+        day_number = row_date.day
+        demand_value = find_import_row_demand(values, date_column)
+        if demand_value is None:
+            demand_value = current_demand[day_number]
+        else:
+            demand_updates[day_number] = demand_value
+        slot_count = expected_import_slot_count(demand_value)
+        assignment_cells = values[date_column + 1:date_column + 1 + MAX_IMPORT_SHIFT_COLUMNS]
+        assignments = []
+
+        for slot_index in range(slot_count):
+            cell_value = assignment_cells[slot_index] if slot_index < len(assignment_cells) else None
+            assignment, invalid, unknown = parse_import_assignment_cell(cell_value, location["workers"], slot_index)
+            assignments.append(assignment)
+            warning_count += int(invalid)
+            unknown_worker_count += int(unknown)
+            assigned_count += int(bool(assignment and assignment.get("worker_name")))
+
+        for slot_index in range(slot_count, min(len(assignment_cells), MAX_IMPORT_SHIFT_COLUMNS)):
+            assignment, _, unknown = parse_import_assignment_cell(assignment_cells[slot_index], location["workers"], slot_index)
+            if not assignment:
+                continue
+            assignments.append(assignment)
+            unknown_worker_count += int(unknown)
+            assigned_count += int(bool(assignment.get("worker_name")))
+
+        imported_days[day_number] = {"day": day_number, "assignments": assignments}
+
+    if not imported_days:
+        raise ScheduleImportError("no_rows")
+
+    inferred_time_count = infer_blank_import_times(imported_days, year, month)
+    return {
+        "schedule": [imported_days[day] for day in sorted(imported_days)],
+        "demand_updates": demand_updates,
+        "day_count": len(imported_days),
+        "assigned_count": assigned_count,
+        "inferred_time_count": inferred_time_count,
+        "unknown_worker_count": unknown_worker_count,
+        "warning_count": warning_count,
+    }
+
+
+def get_import_sheet_candidates(location, location_id):
+    return [location.get("name"), get_location_rule(location_id).get("name"), location_id.replace("-", " ")]
+
+
+def select_import_worksheet(workbook, requested_sheet_name, location, location_id):
+    worksheets = list(workbook.worksheets)
+    if not worksheets:
+        raise ScheduleImportError("unreadable")
+
+    normalized_titles = {normalize_text(sheet.title): sheet for sheet in worksheets}
+    if requested_sheet_name:
+        requested = normalized_titles.get(normalize_text(requested_sheet_name))
+        if not requested:
+            raise ScheduleImportError("sheet_not_found")
+        return requested
+
+    candidates = [normalize_text(value) for value in get_import_sheet_candidates(location, location_id) if value]
+    for candidate in candidates:
+        if candidate in normalized_titles:
+            return normalized_titles[candidate]
+
+    if "grafikas" in normalized_titles:
+        return normalized_titles["grafikas"]
+    if len(worksheets) == 1:
+        return worksheets[0]
+
+    ranked = []
+    for sheet in worksheets:
+        normalized_title = normalize_text(sheet.title)
+        for candidate in candidates:
+            if len(candidate) >= 3 and (candidate in normalized_title or normalized_title in candidate):
+                score = 0.96
+            else:
+                score = SequenceMatcher(None, normalized_title, candidate).ratio()
+            ranked.append((score, sheet.title, sheet))
+    ranked.sort(key=lambda item: (-item[0], item[1].lower()))
+    if ranked and ranked[0][0] >= 0.78:
+        return ranked[0][2]
+    raise ScheduleImportError("sheet_not_found")
+
+
+def decode_import_csv(file_bytes):
+    text = None
+    for encoding in ("utf-8-sig", "cp1257", "latin-1"):
+        try:
+            text = file_bytes.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    if text is None:
+        raise ScheduleImportError("unreadable")
+    try:
+        dialect = csv.Sniffer().sniff(text[:4096], delimiters=",;\t")
+    except csv.Error:
+        dialect = csv.excel
+    return list(csv.reader(StringIO(text), dialect))[:MAX_IMPORT_ROWS]
+
+
+def read_partial_schedule_upload(file_bytes, filename, requested_sheet_name, location, location_id):
+    extension = Path(filename or "").suffix.lower()
+    if extension not in {".xlsx", ".csv"}:
+        raise ScheduleImportError("unsupported")
+    if not file_bytes:
+        raise ScheduleImportError("empty_file")
+    if len(file_bytes) > MAX_IMPORT_BYTES:
+        raise ScheduleImportError("too_large")
+
+    if extension == ".csv":
+        rows = decode_import_csv(file_bytes)
+        sheet_name = "CSV"
+    else:
+        try:
+            workbook = load_workbook(BytesIO(file_bytes), read_only=True, data_only=True, keep_links=False)
+            worksheet = select_import_worksheet(workbook, requested_sheet_name, location, location_id)
+            sheet_name = worksheet.title
+            rows = [list(row[:MAX_IMPORT_COLUMNS]) for _, row in zip(range(MAX_IMPORT_ROWS), worksheet.iter_rows(values_only=True))]
+            workbook.close()
+        except ScheduleImportError:
+            raise
+        except Exception as error:
+            raise ScheduleImportError("unreadable") from error
+
+    result = parse_partial_schedule_rows(rows, location, location_id)
+    result["sheet_name"] = sheet_name
+    return result
+
+
 PREFERRED_WORKER_FILL_COLORS = {
     "worker a": "9FC5E8",
     "worker b": "B6D7A8",
@@ -1662,10 +2011,24 @@ def apply_schedule_form_assignments(generated_schedule, workers, form_data):
         for assignment_index, assignment in enumerate(assignments):
             if not isinstance(assignment, dict):
                 continue
+            time_field_name = f"assignment_time_{day}_{assignment_index}"
+            if time_field_name in form_data:
+                raw_shift_time = str(form_data.get(time_field_name) or "").strip()
+                interval = parse_assignment_interval(raw_shift_time)
+                if interval:
+                    assignment["shift_time"] = f"{interval[0]}-{interval[1]}"
+                    assignment.pop("time_warning", None)
+                else:
+                    assignment["time_warning"] = (
+                        f"Rankinis laikas '{raw_shift_time or '(tuscia)'}' netinkamas; "
+                        f"paliktas {assignment.get('shift_time') or 'sablono laikas'}."
+                    )
             field_name = f"assignment_{day}_{assignment_index}"
             if field_name not in form_data:
                 continue
             worker_id = str(form_data.get(field_name) or "").strip()
+            if worker_id == "__preserve__":
+                continue
             worker = workers_by_id.get(worker_id)
             if worker:
                 assignment["worker_id"] = worker_id
@@ -1674,6 +2037,41 @@ def apply_schedule_form_assignments(generated_schedule, workers, form_data):
                 assignment["worker_id"] = None
                 assignment["worker_name"] = None
     return updated_schedule
+
+
+def get_import_notice():
+    status = request.args.get("import_status")
+    if status == "ok":
+        day_count = sanitize_int(request.args.get("imported_days"), 0, 0, 366)
+        assigned_count = sanitize_int(request.args.get("imported_assignments"), 0, 0, 5000)
+        inferred_count = sanitize_int(request.args.get("inferred_times"), 0, 0, 5000)
+        unknown_count = sanitize_int(request.args.get("unknown_workers"), 0, 0, 5000)
+        warning_count = sanitize_int(request.args.get("import_warnings"), 0, 0, 5000)
+        sheet_name = str(request.args.get("import_sheet") or "").strip()[:80]
+        text = f"Importuota {day_count} d. ir {assigned_count} paskirtos pamainos"
+        if sheet_name:
+            text += f" iš lapo „{sheet_name}“"
+        text += "."
+        if inferred_count:
+            text += f" {inferred_count} tuščių pamainų perėmė artimiausią įkelto grafiko laiką."
+        if unknown_count:
+            text += f" Neatpažintų darbuotojų: {unknown_count}; jų įrašai palikti peržiūrai."
+        if warning_count:
+            text += f" Neaiškių pamainos langelių praleista: {warning_count}."
+        return {"kind": "success", "text": text}
+
+    if status == "error":
+        messages = {
+            "missing_file": "Pasirink .xlsx arba .csv grafiko failą.",
+            "empty_file": "Įkeltas failas tuščias.",
+            "too_large": "Failas per didelis. Didžiausias dydis yra 5 MB.",
+            "unsupported": "Tinka tik .xlsx arba .csv failai.",
+            "sheet_not_found": "Nepavyko parinkti lokacijos lapo. Įrašyk tikslų lapo pavadinimą ir bandyk dar kartą.",
+            "no_rows": "Faile nerasta programoje pasirinkto mėnesio grafiko eilučių.",
+            "unreadable": "Failo nepavyko saugiai perskaityti.",
+        }
+        return {"kind": "error", "text": messages.get(request.args.get("import_error"), messages["unreadable"])}
+    return None
 
 
 def render_home_page(location_id):
@@ -1697,6 +2095,7 @@ def render_home_page(location_id):
         default_demand_raw=build_default_demand_raw(location_id, settings["year"], settings["month"]),
         dashboard_stats=build_dashboard_stats(location, workers, demand_rows),
         schedule_progress=build_schedule_progress(location["generated_schedule"]),
+        import_notice=get_import_notice(),
         build_number=BUILD_NUMBER,
         generated_schedule=location["generated_schedule"],
         worker_summary=location["worker_summary"],
@@ -1846,6 +2245,60 @@ def generate_schedule_route():
     location["schedule_insights"] = build_schedule_insights(location, generated_schedule, worker_summary)
     save_app_data()
     return redirect(url_for("home", location=location_id, _anchor="schedule"))
+
+
+@app.route("/import_partial_schedule", methods=["POST"])
+def import_partial_schedule_route():
+    location_id, location = get_location(get_requested_location_id())
+    upload = request.files.get("schedule_file")
+    if not upload or not upload.filename:
+        return redirect(url_for("home", location=location_id, import_status="error", import_error="missing_file", _anchor="schedule-import"))
+
+    try:
+        file_bytes = upload.read(MAX_IMPORT_BYTES + 1)
+        import_result = read_partial_schedule_upload(
+            file_bytes,
+            upload.filename,
+            request.form.get("sheet_name", "").strip(),
+            location,
+            location_id,
+        )
+    except ScheduleImportError as error:
+        return redirect(url_for("home", location=location_id, import_status="error", import_error=error.code, _anchor="schedule-import"))
+    except OSError:
+        return redirect(url_for("home", location=location_id, import_status="error", import_error="unreadable", _anchor="schedule-import"))
+
+    demand_map, _ = get_demand_context(location, location_id)
+    demand_map.update(import_result["demand_updates"])
+    location["demand_raw"] = "\n".join(
+        format_demand_value(demand_map[day])
+        for day in range(1, get_days_in_month(location["schedule_settings"]["year"], location["schedule_settings"]["month"]) + 1)
+    )
+    workers = build_workers_for_view(location, location_id)
+    generated_schedule, worker_summary = generate_month_schedule(
+        workers,
+        location["schedule_settings"],
+        location_id,
+        demand_map,
+        existing_schedule=import_result["schedule"],
+        fill_open_slots=False,
+    )
+    location["generated_schedule"] = generated_schedule
+    location["worker_summary"] = worker_summary
+    location["schedule_insights"] = build_schedule_insights(location, generated_schedule, worker_summary)
+    save_app_data()
+    return redirect(url_for(
+        "home",
+        location=location_id,
+        import_status="ok",
+        imported_days=import_result["day_count"],
+        imported_assignments=import_result["assigned_count"],
+        inferred_times=import_result["inferred_time_count"],
+        unknown_workers=import_result["unknown_worker_count"],
+        import_warnings=import_result["warning_count"],
+        import_sheet=import_result["sheet_name"],
+        _anchor="schedule-import",
+    ))
 
 
 def update_existing_schedule(location_id, location, fill_open_slots):
