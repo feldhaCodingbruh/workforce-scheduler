@@ -18,6 +18,8 @@
         form { display:grid; gap:14px; }
         label { font-weight:700; }
         input, select, textarea, button { width:100%; padding:12px; font:inherit; border-radius:8px; border:1px solid var(--border); background:var(--panel); color:var(--text); }
+        .checkbox-field { display:inline-flex; align-items:center; gap:8px; width:fit-content; }
+        .checkbox-field input { width:auto; margin:0; }
         textarea { min-height:420px; resize:vertical; font-family:"Cascadia Mono",Consolas,monospace; line-height:1.45; }
         .hint { color:var(--muted); font-size:14px; line-height:1.5; }
         .actions { display:flex; flex-wrap:wrap; gap:10px; }
@@ -51,6 +53,11 @@
                     <option value="{{ value }}" {% if worker.etatas == value %}selected{% endif %}>{{ value }}</option>
                 {% endfor %}
             </select>
+
+            <label class="checkbox-field" for="is_newcomer">
+                <input type="checkbox" id="is_newcomer" name="is_newcomer" value="1" {% if worker.is_newcomer %}checked{% endif %}>
+                <span>Naujokas / naujokė</span>
+            </label>
 
             <label for="availability">Menesio galimumas</label>
             <div class="hint">Viena eilute = viena kalendorine diena. Vidines tuscios eilutes issaugomos ir nepastumia velesniu dienu.</div>

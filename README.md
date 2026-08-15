@@ -27,6 +27,7 @@ adding repeatable scheduling rules and visible warnings.
   same-slot timing into later blank days.
 - Per-shift time editing before saving or completing a draft.
 - Employee editing and incomplete-input warnings.
+- A newcomer flag that blocks automatic and new manual opening assignments while warning on preserved imported ones.
 - Compact Excel schedule export with warnings and employee summaries.
 - Optional OpenAI-assisted schedule suggestions when `OPENAI_API_KEY` is set.
 - Local employee data and generated exports excluded from Git.

@@ -57,6 +57,18 @@ class AvailabilityParserTests(unittest.TestCase):
         }])
 
         self.assertEqual(workers[0]["availability_raw"], "\r\nGaliu\r\n\r\n")
+        self.assertNotIn("is_newcomer", workers[0])
+
+    def test_worker_sanitizing_accepts_newcomer_flag(self):
+        workers = app.sanitize_workers([{
+            "id": "worker-1",
+            "name": "Worker",
+            "etatas": "0.5",
+            "availability_raw": "galiu",
+            "is_newcomer": "true",
+        }])
+
+        self.assertTrue(workers[0]["is_newcomer"])
 
     def test_blank_day_does_not_count_as_complete_input(self):
         self.assertEqual(app.get_worker_status(3, 3, 2), "Truksta 1 d.")
@@ -177,6 +189,79 @@ class ScheduleRegressionTests(unittest.TestCase):
         )
         self.assertEqual(schedule[1]["assignments"][0]["worker_name"], "Worker B")
 
+    def test_newcomer_is_never_auto_assigned_to_opening_shift(self):
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        demand = {day: (2.0 if day == 1 else 0.0) for day in range(1, 31)}
+        workers = [
+            {
+                "id": "a",
+                "name": "Worker A",
+                "etatas": "1.0",
+                "availability_raw": "galiu",
+                "is_newcomer": True,
+            },
+            {
+                "id": "b",
+                "name": "Worker B",
+                "etatas": "1.0",
+                "availability_raw": "galiu",
+            },
+        ]
+        runtime_workers = [
+            app.build_worker_runtime(worker, settings, "location-g", demand)
+            for worker in workers
+        ]
+
+        schedule, _ = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            "location-g",
+            demand,
+        )
+
+        self.assertEqual(
+            [item["worker_name"] for item in schedule[0]["assignments"]],
+            ["Worker B", "Worker A"],
+        )
+
+    def test_existing_newcomer_opening_is_preserved_with_warning(self):
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        demand = {day: (1.0 if day == 1 else 0.0) for day in range(1, 31)}
+        worker = {
+            "id": "a",
+            "name": "Worker A",
+            "etatas": "1.0",
+            "availability_raw": "galiu",
+            "is_newcomer": True,
+        }
+        runtime_workers = [app.build_worker_runtime(worker, settings, "location-g", demand)]
+        partial_schedule = [{
+            "day": 1,
+            "assignments": [{
+                "shift_label": "Pilna 1",
+                "slot_kind": "Pilna",
+                "shift_time": "10:00-18:30",
+                "worker_id": "a",
+                "worker_name": "Worker A",
+            }],
+        }]
+
+        completed_schedule, _ = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            "location-g",
+            demand,
+            existing_schedule=partial_schedule,
+        )
+
+        self.assertEqual(completed_schedule[0]["assignments"][0]["worker_name"], "Worker A")
+        self.assertTrue(
+            any(
+                "naujokas" in warning and "atidarymo" in warning
+                for warning in completed_schedule[0]["warnings"]
+            )
+        )
+
     def test_worker_with_partial_availability_stays_in_summary(self):
         settings = {"year": 2026, "month": 6, "full_time_hours": 160}
         demand = {day: (1.0 if day == 1 else 0.0) for day in range(1, 31)}
@@ -288,6 +373,34 @@ class ScheduleRegressionTests(unittest.TestCase):
         self.assertEqual(updated[0]["assignments"][0]["worker_id"], "b")
         self.assertIsNone(updated[0]["assignments"][1]["worker_name"])
         self.assertEqual(schedule[0]["assignments"][0]["worker_name"], None)
+
+    def test_schedule_form_rejects_new_newcomer_opening_assignment(self):
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        schedule = [{
+            "day": 1,
+            "assignments": [{
+                "shift_time": "10:00-18:30",
+                "worker_id": None,
+                "worker_name": None,
+            }],
+        }]
+        workers = [{
+            "id": "a",
+            "name": "Worker A",
+            "is_newcomer": True,
+        }]
+
+        updated = app.apply_schedule_form_assignments(
+            schedule,
+            workers,
+            {"assignment_1_0": "a"},
+            schedule_settings=settings,
+            location_id="location-g",
+        )
+
+        assignment = updated[0]["assignments"][0]
+        self.assertIsNone(assignment["worker_name"])
+        self.assertIn("nepasirinktas atidarymui", assignment["selection_warning"])
 
 
 class ManualTimeAndImportTests(unittest.TestCase):
@@ -415,6 +528,7 @@ class WorkerEditingTests(unittest.TestCase):
                     "name": "New",
                     "etatas": "0.75",
                     "availability": "\n\ngaliu\n\nnegaliu\n",
+                    "is_newcomer": "1",
                 },
             )
 
@@ -422,11 +536,12 @@ class WorkerEditingTests(unittest.TestCase):
         self.assertEqual(self.location["workers"][0]["name"], "New")
         self.assertEqual(self.location["workers"][0]["etatas"], "0.75")
         self.assertEqual(self.location["workers"][0]["availability_raw"], "\n\ngaliu\n\nnegaliu\n")
+        self.assertTrue(self.location["workers"][0]["is_newcomer"])
         self.assertEqual(self.location["generated_schedule"], [])
 
     def test_edit_page_initializes_edge_blank_days_without_html_newline_loss(self):
         self.location["workers"] = [
-            {"id": "worker-1", "name": "Worker", "etatas": "0.5", "availability_raw": "\n\nGaliu\n"}
+            {"id": "worker-1", "name": "Worker", "etatas": "0.5", "availability_raw": "\n\nGaliu\n", "is_newcomer": True}
         ]
         client = app.app.test_client()
 
@@ -435,6 +550,7 @@ class WorkerEditingTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn('<textarea id="availability" name="availability" spellcheck="false"></textarea>', html)
+        self.assertIn('name="is_newcomer" value="1" checked', html)
         self.assertIn('document.getElementById("availability").value = "\\n\\nGaliu\\n";', html)
 
 
@@ -539,6 +655,20 @@ class PartialScheduleRouteTests(unittest.TestCase):
         self.assertIn('name="schedule_file"', html)
         self.assertIn("Išsaugoti dalį", html)
         self.assertIn("Užbaigti grafiką", html)
+
+
+    def test_opening_select_disables_newcomer_option(self):
+        self.location["workers"][0]["is_newcomer"] = True
+        client = app.app.test_client()
+
+        response = client.get("/?location=location-a")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(
+            '<option value="a" disabled>Worker A (naujokas / naujokė)</option>',
+            html,
+        )
 
 
 class WorkbookExportTests(unittest.TestCase):

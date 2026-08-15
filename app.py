@@ -27,7 +27,7 @@ DEFAULT_MONTH = 3
 DEFAULT_YEAR = 2026
 DEFAULT_FULL_TIME_HOURS = 160
 RULES_VERSION = 6
-BUILD_NUMBER = "0.7.2"
+BUILD_NUMBER = "0.8.0"
 DEFAULT_AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 FULL_SHIFT_MIN_HOURS = 7.0
 HALF_SHIFT_HOURS = 4.0
@@ -147,6 +147,12 @@ def sanitize_int(value, default, minimum, maximum):
     except (TypeError, ValueError):
         return default
     return parsed if minimum <= parsed <= maximum else default
+
+
+def sanitize_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def is_valid_time(time_str):
@@ -294,6 +300,16 @@ def adjust_shift_for_special_opening(year, month, day, shift, index):
     return adjusted
 
 
+def get_day_opening_start_minutes(location_id, year, month, day):
+    day_rules = get_day_rules_for_weekday(location_id, calendar.weekday(year, month, day))
+    opening_shift = build_standard_opening_full_shift(day_rules, year, month, day)
+    if not opening_shift:
+        return None
+    opening_shift["role"] = "full"
+    opening_shift = adjust_shift_for_special_opening(year, month, day, opening_shift, 0)
+    return time_to_minutes(opening_shift["start"])
+
+
 def get_full_shift_for_requested_index(full_templates, index):
     if index < len(full_templates):
         return deepcopy(full_templates[index]), False
@@ -347,7 +363,15 @@ def sanitize_workers(raw_workers):
         etatas = str(worker.get("etatas") or "").strip()
         if not name or not etatas:
             continue
-        workers.append({"id": str(worker.get("id") or uuid4().hex), "name": name, "etatas": etatas, "availability_raw": str(worker.get("availability_raw") or "")})
+        sanitized_worker = {
+            "id": str(worker.get("id") or uuid4().hex),
+            "name": name,
+            "etatas": etatas,
+            "availability_raw": str(worker.get("availability_raw") or ""),
+        }
+        if "is_newcomer" in worker:
+            sanitized_worker["is_newcomer"] = sanitize_bool(worker.get("is_newcomer"))
+        workers.append(sanitized_worker)
     return workers
 
 
@@ -844,6 +868,10 @@ def is_closing_assignment(assigned_end, closing_end_minutes):
     return closing_end_minutes is not None and time_to_minutes(assigned_end) == closing_end_minutes
 
 
+def is_opening_assignment(assigned_start, opening_start_minutes):
+    return opening_start_minutes is not None and time_to_minutes(assigned_start) == opening_start_minutes
+
+
 def assignment_time_to_minutes(shift_time):
     start_str, end_str = shift_time.split("-")
     return time_to_minutes(start_str), time_to_minutes(end_str)
@@ -955,6 +983,7 @@ def summarize_rejection_reasons(reason_counts):
 
     priority = [
         "jau priskirtas kita pamaina ta diena",
+        "naujokas negali dirbti atidarymo",
         "negali dirbti sios pamainos",
         "virsytu 5 dienas is eiles",
         "per mazai poilsio tarp pamainu",
@@ -1030,6 +1059,7 @@ def build_schedule_blueprint(existing_schedule, schedule_settings, location_id, 
             "assignments": assignments,
             "warnings": list(day_warnings),
             "closing_end_minutes": get_day_closing_end_minutes(shifts),
+            "opening_start_minutes": get_day_opening_start_minutes(location_id, year, month, day),
         }
 
         for shift_index, shift in enumerate(shifts):
@@ -1041,6 +1071,8 @@ def build_schedule_blueprint(existing_schedule, schedule_settings, location_id, 
                     append_unique_warning(day_record, f"Rankines pamainos {shift['label']} laikas buvo netinkamas; paliktas sablono laikas.")
             if existing_assignment.get("time_warning"):
                 append_unique_warning(day_record, str(existing_assignment["time_warning"]))
+            if existing_assignment.get("selection_warning"):
+                append_unique_warning(day_record, str(existing_assignment["selection_warning"]))
             worker_name = str(existing_assignment.get("worker_name") or "").strip() or None
             worker_id = str(existing_assignment.get("worker_id") or "").strip() or None
             effective_shift = build_effective_template_shift(shift, interval, existing_assignment)
@@ -1194,6 +1226,8 @@ def generate_month_schedule(worker_list, schedule_settings, location_id, demand_
             seen_workers.add(worker_index)
             parsed_day = worker["parsed_availability"][day - 1]
             start_time, end_time = parse_assignment_interval(assignment["shift_time"])
+            if worker.get("is_newcomer") and is_opening_assignment(start_time, day_record["opening_start_minutes"]):
+                append_unique_warning(day_record, f"Rankinis pasirinkimas: {worker['name']} pazymetas kaip naujokas / naujoke ir negali dirbti atidarymo pamainos.")
             if not can_cover_interval(parsed_day, start_time, end_time):
                 append_unique_warning(day_record, f"Rankinis pasirinkimas neatitinka {worker['name']} galimybiu ({start_time}-{end_time}).")
             register_assignment_state(
@@ -1239,6 +1273,10 @@ def generate_month_schedule(worker_list, schedule_settings, location_id, demand_
                 fit_info = check_one_shift_fit(parsed_day, shift["start"], shift["end"])
                 if not fit_info["ok"]:
                     rejection_reasons["negali dirbti sios pamainos"] = rejection_reasons.get("negali dirbti sios pamainos", 0) + 1
+                    continue
+                is_opening = is_opening_assignment(fit_info["assigned_start"], day_record["opening_start_minutes"])
+                if worker.get("is_newcomer") and is_opening:
+                    rejection_reasons["naujokas negali dirbti atidarymo"] = rejection_reasons.get("naujokas negali dirbti atidarymo", 0) + 1
                     continue
                 if would_exceed_consecutive_limit(assigned_days[worker_index], day):
                     rejection_reasons["virsytu 5 dienas is eiles"] = rejection_reasons.get("virsytu 5 dienas is eiles", 0) + 1
@@ -1298,6 +1336,7 @@ def generate_month_schedule(worker_list, schedule_settings, location_id, demand_
     for day in range(1, get_days_in_month(year, month) + 1):
         day_record = day_records_by_day[day]
         day_record.pop("closing_end_minutes", None)
+        day_record.pop("opening_start_minutes", None)
         for assignment in day_record["assignments"]:
             assignment.pop("worker_index", None)
             assignment.pop("locked", None)
@@ -2010,19 +2049,50 @@ def build_schedule_progress(generated_schedule):
     }
 
 
-def apply_schedule_form_assignments(generated_schedule, workers, form_data):
+def annotate_schedule_openings(generated_schedule, schedule_settings, location_id):
+    annotated_schedule = deepcopy(generated_schedule if isinstance(generated_schedule, list) else [])
+    year, month = schedule_settings["year"], schedule_settings["month"]
+    days_in_month = get_days_in_month(year, month)
+    for day_record in annotated_schedule:
+        if not isinstance(day_record, dict):
+            continue
+        day = sanitize_int(day_record.get("day"), 0, 1, days_in_month)
+        opening_start_minutes = get_day_opening_start_minutes(location_id, year, month, day) if day else None
+        for assignment in day_record.get("assignments", []):
+            if not isinstance(assignment, dict):
+                continue
+            interval = parse_assignment_interval(assignment.get("shift_time"))
+            assignment["is_opening"] = bool(
+                interval and is_opening_assignment(interval[0], opening_start_minutes)
+            )
+    return annotated_schedule
+
+
+def apply_schedule_form_assignments(generated_schedule, workers, form_data, schedule_settings=None, location_id=None):
     updated_schedule = deepcopy(generated_schedule)
     workers_by_id = {str(worker.get("id")): worker for worker in workers if worker.get("id")}
+    year = schedule_settings.get("year") if isinstance(schedule_settings, dict) else None
+    month = schedule_settings.get("month") if isinstance(schedule_settings, dict) else None
     for day_record in updated_schedule:
         if not isinstance(day_record, dict):
             continue
         day = day_record.get("day")
+        opening_start_minutes = None
+        if location_id and year and month:
+            valid_day = sanitize_int(day, 0, 1, get_days_in_month(year, month))
+            if valid_day:
+                opening_start_minutes = get_day_opening_start_minutes(location_id, year, month, valid_day)
         assignments = day_record.get("assignments", [])
         if not isinstance(assignments, list):
             continue
         for assignment_index, assignment in enumerate(assignments):
             if not isinstance(assignment, dict):
                 continue
+            original_shift_time = assignment.get("shift_time")
+            original_interval = parse_assignment_interval(original_shift_time)
+            original_is_opening = bool(assignment.get("is_opening"))
+            if original_interval and opening_start_minutes is not None:
+                original_is_opening = is_opening_assignment(original_interval[0], opening_start_minutes)
             time_field_name = f"assignment_time_{day}_{assignment_index}"
             if time_field_name in form_data:
                 raw_shift_time = str(form_data.get(time_field_name) or "").strip()
@@ -2043,11 +2113,29 @@ def apply_schedule_form_assignments(generated_schedule, workers, form_data):
                 continue
             worker = workers_by_id.get(worker_id)
             if worker:
+                interval = parse_assignment_interval(assignment.get("shift_time"))
+                is_opening = bool(assignment.get("is_opening"))
+                if interval and opening_start_minutes is not None:
+                    is_opening = is_opening_assignment(interval[0], opening_start_minutes)
+                assignment["is_opening"] = is_opening
+                existing_worker_id = str(assignment.get("worker_id") or "")
+                if worker.get("is_newcomer") and is_opening and not (
+                    existing_worker_id == worker_id and original_is_opening
+                ):
+                    if existing_worker_id == worker_id and original_shift_time:
+                        assignment["shift_time"] = original_shift_time
+                        assignment["is_opening"] = original_is_opening
+                    assignment["selection_warning"] = (
+                        f"{worker['name']} nepasirinktas atidarymui, nes pazymetas kaip naujokas / naujoke."
+                    )
+                    continue
                 assignment["worker_id"] = worker_id
                 assignment["worker_name"] = worker["name"]
+                assignment.pop("selection_warning", None)
             else:
                 assignment["worker_id"] = None
                 assignment["worker_name"] = None
+                assignment.pop("selection_warning", None)
     return updated_schedule
 
 
@@ -2092,6 +2180,11 @@ def render_home_page(location_id):
     expected_days = get_days_in_month(settings["year"], settings["month"])
     _, demand_rows = get_demand_context(location, location_id)
     workers = build_workers_for_view(location, location_id)
+    generated_schedule = annotate_schedule_openings(
+        location["generated_schedule"],
+        settings,
+        location_id,
+    )
     return render_template(
         "index.html",
         locations=get_location_tabs(location_id),
@@ -2109,7 +2202,7 @@ def render_home_page(location_id):
         schedule_progress=build_schedule_progress(location["generated_schedule"]),
         import_notice=get_import_notice(),
         build_number=BUILD_NUMBER,
-        generated_schedule=location["generated_schedule"],
+        generated_schedule=generated_schedule,
         worker_summary=location["worker_summary"],
         schedule_insights=location["schedule_insights"],
         ai_status=get_ai_status(),
@@ -2207,8 +2300,15 @@ def add_worker():
     name = request.form.get("name", "").strip()
     etatas = request.form.get("etatas", "").strip()
     availability_raw = str(request.form.get("availability", "") or "")
+    is_newcomer = request.form.get("is_newcomer") == "1"
     if name and etatas:
-        location["workers"].append({"id": uuid4().hex, "name": name, "etatas": etatas, "availability_raw": availability_raw})
+        location["workers"].append({
+            "id": uuid4().hex,
+            "name": name,
+            "etatas": etatas,
+            "availability_raw": availability_raw,
+            "is_newcomer": is_newcomer,
+        })
         clear_generated_results(location)
         save_app_data()
     return redirect(url_for("home", location=location_id))
@@ -2232,8 +2332,14 @@ def update_worker(worker_id):
     name = request.form.get("name", "").strip()
     etatas = request.form.get("etatas", "").strip()
     availability_raw = str(request.form.get("availability", "") or "")
+    is_newcomer = request.form.get("is_newcomer") == "1"
     if name and etatas:
-        worker.update({"name": name, "etatas": etatas, "availability_raw": availability_raw})
+        worker.update({
+            "name": name,
+            "etatas": etatas,
+            "availability_raw": availability_raw,
+            "is_newcomer": is_newcomer,
+        })
         clear_generated_results(location)
         save_app_data()
     return redirect(url_for("home", location=location_id, _anchor="workers"))
@@ -2318,7 +2424,13 @@ def update_existing_schedule(location_id, location, fill_open_slots):
         abort(400)
     demand_map, _ = get_demand_context(location, location_id)
     workers = build_workers_for_view(location, location_id)
-    edited_schedule = apply_schedule_form_assignments(location["generated_schedule"], workers, request.form)
+    edited_schedule = apply_schedule_form_assignments(
+        location["generated_schedule"],
+        workers,
+        request.form,
+        schedule_settings=location["schedule_settings"],
+        location_id=location_id,
+    )
     generated_schedule, worker_summary = generate_month_schedule(
         workers,
         location["schedule_settings"],

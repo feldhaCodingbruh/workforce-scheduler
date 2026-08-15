@@ -80,6 +80,8 @@
         .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
         .row.spread { justify-content:space-between; }
         input, select, textarea, button { padding:12px; font-size:15px; border-radius:10px; border:1px solid #ccc; }
+        .checkbox-field { display:inline-flex; align-items:center; gap:8px; width:fit-content; font-weight:700; }
+        .checkbox-field input { width:auto; margin:0; }
         textarea { min-height:220px; resize:vertical; font-family:inherit; }
         .demand-textarea { min-height:320px; }
         button { cursor:pointer; border:none; background:var(--accent); color:#fff; width:fit-content; padding-left:18px; padding-right:18px; }
@@ -229,6 +231,10 @@
                 <option value="0.75">0.75</option>
                 <option value="1.0">1.0</option>
             </select>
+            <label class="checkbox-field" for="is_newcomer">
+                <input type="checkbox" id="is_newcomer" name="is_newcomer" value="1">
+                <span>Naujokas / naujokė</span>
+            </label>
             <label for="availability"><strong>Menesio galimumas</strong></label>
             <div class="small-text">Viena eilute = viena diena. Pirma bando taisykles, o jei tekstas neaiskus ir ijungtas AI, tada kvieciamas AI parseris.</div>
             <textarea name="availability" id="availability" placeholder="Pvz.: galiu / nuo 14 / iki 17 / 10-18 / nezinau"></textarea>
@@ -291,7 +297,7 @@
                 <tbody>
                     {% for worker in workers %}
                     <tr data-worker-row data-worker-name="{{ worker.name|lower }}">
-                        <td>{{ worker.name }}</td>
+                        <td>{{ worker.name }}{% if worker.is_newcomer %} <span class="badge badge-info">Naujokas</span>{% endif %}</td>
                         <td>{{ worker.etatas }}</td>
                         <td><span class="count-badge">{{ worker.filled_day_count }} / {{ expected_days }}</span></td>
                         <td>{% if worker.status == "Gerai" %}<span class="status-ok">{{ worker.status }}</span>{% else %}<span class="status-bad">{{ worker.status }}</span>{% endif %}</td>
@@ -365,8 +371,9 @@
                                     <option value="" {% if not assignment.worker_name and not assignment.worker_id %}selected{% endif %}>Nepriskirta</option>
                                     {% set worker_match = namespace(found=false) %}
                                     {% for worker in workers %}
-                                        {% if assignment.worker_id == worker.id or (not assignment.worker_id and assignment.worker_name == worker.name) %}{% set worker_match.found = true %}{% endif %}
-                                        <option value="{{ worker.id }}" {% if assignment.worker_id == worker.id or (not assignment.worker_id and assignment.worker_name == worker.name) %}selected{% endif %}>{{ worker.name }}</option>
+                                        {% set worker_selected = assignment.worker_id == worker.id or (not assignment.worker_id and assignment.worker_name == worker.name) %}
+                                        {% if worker_selected %}{% set worker_match.found = true %}{% endif %}
+                                        <option value="{{ worker.id }}" {% if worker_selected %}selected{% elif assignment.is_opening and worker.is_newcomer %}disabled{% endif %}>{{ worker.name }}{% if worker.is_newcomer %} (naujokas / naujokė){% endif %}</option>
                                     {% endfor %}
                                     {% if (assignment.worker_name or assignment.worker_id) and not worker_match.found %}
                                         <option value="__preserve__" selected>Nerastas: {{ assignment.worker_name or assignment.worker_id }}</option>
