@@ -27,7 +27,7 @@ DEFAULT_MONTH = 3
 DEFAULT_YEAR = 2026
 DEFAULT_FULL_TIME_HOURS = 160
 RULES_VERSION = 6
-BUILD_NUMBER = "0.7.0"
+BUILD_NUMBER = "0.7.1"
 DEFAULT_AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 FULL_SHIFT_MIN_HOURS = 7.0
 HALF_SHIFT_HOURS = 4.0
@@ -326,6 +326,10 @@ def sanitize_schedule_settings(raw_settings):
     }
 
 
+def normalize_availability_raw(raw_text):
+    return str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
 def sanitize_workers(raw_workers):
     workers = []
     for worker in raw_workers if isinstance(raw_workers, list) else []:
@@ -335,7 +339,7 @@ def sanitize_workers(raw_workers):
         etatas = str(worker.get("etatas") or "").strip()
         if not name or not etatas:
             continue
-        workers.append({"id": str(worker.get("id") or uuid4().hex), "name": name, "etatas": etatas, "availability_raw": str(worker.get("availability_raw") or "").strip()})
+        workers.append({"id": str(worker.get("id") or uuid4().hex), "name": name, "etatas": etatas, "availability_raw": normalize_availability_raw(worker.get("availability_raw"))})
     return workers
 
 
@@ -399,11 +403,10 @@ EXPORTS_DIR.mkdir(exist_ok=True)
 
 
 def parse_availability_lines(raw_text):
-    normalized = str(raw_text or "").replace("\r\n", "\n").replace("\r", "\n")
-    lines = [line.strip() for line in normalized.split("\n")]
-    while lines and not lines[-1]:
-        lines.pop()
-    return lines
+    normalized = normalize_availability_raw(raw_text)
+    if not normalized:
+        return []
+    return [line.strip() for line in normalized.split("\n")]
 
 
 def parse_daily_demand_map(raw_text, year, month, location_id):
@@ -2194,7 +2197,7 @@ def add_worker():
     location_id, location = get_location(get_requested_location_id())
     name = request.form.get("name", "").strip()
     etatas = request.form.get("etatas", "").strip()
-    availability_raw = request.form.get("availability", "").strip()
+    availability_raw = normalize_availability_raw(request.form.get("availability", ""))
     if name and etatas:
         location["workers"].append({"id": uuid4().hex, "name": name, "etatas": etatas, "availability_raw": availability_raw})
         clear_generated_results(location)
@@ -2219,7 +2222,7 @@ def update_worker(worker_id):
     worker = get_worker_or_404(location, worker_id)
     name = request.form.get("name", "").strip()
     etatas = request.form.get("etatas", "").strip()
-    availability_raw = request.form.get("availability", "").strip("\r\n")
+    availability_raw = normalize_availability_raw(request.form.get("availability", ""))
     if name and etatas:
         worker.update({"name": name, "etatas": etatas, "availability_raw": availability_raw})
         clear_generated_results(location)

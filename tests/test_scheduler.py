@@ -44,9 +44,19 @@ class AvailabilityParserTests(unittest.TestCase):
         self.assertEqual(parsed["second_from_time"], "19:00")
 
     def test_blank_lines_preserve_calendar_day_positions(self):
-        lines = app.parse_availability_lines("galiu\n\nnegaliu\nnuo 17\n")
+        lines = app.parse_availability_lines("\n\ngaliu\n\nnegaliu\nnuo 17\n")
 
-        self.assertEqual(lines, ["galiu", "", "negaliu", "nuo 17"])
+        self.assertEqual(lines, ["", "", "galiu", "", "negaliu", "nuo 17", ""])
+
+    def test_worker_sanitizing_keeps_edge_blank_days(self):
+        workers = app.sanitize_workers([{
+            "id": "worker-1",
+            "name": "Worker",
+            "etatas": "0.5",
+            "availability_raw": "\r\nGaliu\r\n\r\n",
+        }])
+
+        self.assertEqual(workers[0]["availability_raw"], "\nGaliu\n\n")
 
     def test_blank_day_does_not_count_as_complete_input(self):
         self.assertEqual(app.get_worker_status(3, 3, 2), "Truksta 1 d.")
@@ -389,14 +399,14 @@ class WorkerEditingTests(unittest.TestCase):
                     "location_id": "location-a",
                     "name": "New",
                     "etatas": "0.75",
-                    "availability": "galiu\n\nnegaliu",
+                    "availability": "\n\ngaliu\n\nnegaliu\n",
                 },
             )
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(self.location["workers"][0]["name"], "New")
         self.assertEqual(self.location["workers"][0]["etatas"], "0.75")
-        self.assertEqual(self.location["workers"][0]["availability_raw"], "galiu\n\nnegaliu")
+        self.assertEqual(self.location["workers"][0]["availability_raw"], "\n\ngaliu\n\nnegaliu\n")
         self.assertEqual(self.location["generated_schedule"], [])
 
 
