@@ -48,7 +48,7 @@ class AvailabilityParserTests(unittest.TestCase):
 
         self.assertEqual(lines, ["", "", "galiu", "", "negaliu", "nuo 17", ""])
 
-    def test_worker_sanitizing_keeps_edge_blank_days(self):
+    def test_worker_sanitizing_keeps_exact_edge_blank_days(self):
         workers = app.sanitize_workers([{
             "id": "worker-1",
             "name": "Worker",
@@ -56,7 +56,7 @@ class AvailabilityParserTests(unittest.TestCase):
             "availability_raw": "\r\nGaliu\r\n\r\n",
         }])
 
-        self.assertEqual(workers[0]["availability_raw"], "\nGaliu\n\n")
+        self.assertEqual(workers[0]["availability_raw"], "\r\nGaliu\r\n\r\n")
 
     def test_blank_day_does_not_count_as_complete_input(self):
         self.assertEqual(app.get_worker_status(3, 3, 2), "Truksta 1 d.")

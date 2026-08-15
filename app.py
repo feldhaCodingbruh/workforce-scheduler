@@ -339,7 +339,7 @@ def sanitize_workers(raw_workers):
         etatas = str(worker.get("etatas") or "").strip()
         if not name or not etatas:
             continue
-        workers.append({"id": str(worker.get("id") or uuid4().hex), "name": name, "etatas": etatas, "availability_raw": normalize_availability_raw(worker.get("availability_raw"))})
+        workers.append({"id": str(worker.get("id") or uuid4().hex), "name": name, "etatas": etatas, "availability_raw": str(worker.get("availability_raw") or "")})
     return workers
 
 
@@ -2197,7 +2197,7 @@ def add_worker():
     location_id, location = get_location(get_requested_location_id())
     name = request.form.get("name", "").strip()
     etatas = request.form.get("etatas", "").strip()
-    availability_raw = normalize_availability_raw(request.form.get("availability", ""))
+    availability_raw = str(request.form.get("availability", "") or "")
     if name and etatas:
         location["workers"].append({"id": uuid4().hex, "name": name, "etatas": etatas, "availability_raw": availability_raw})
         clear_generated_results(location)
@@ -2222,7 +2222,7 @@ def update_worker(worker_id):
     worker = get_worker_or_404(location, worker_id)
     name = request.form.get("name", "").strip()
     etatas = request.form.get("etatas", "").strip()
-    availability_raw = normalize_availability_raw(request.form.get("availability", ""))
+    availability_raw = str(request.form.get("availability", "") or "")
     if name and etatas:
         worker.update({"name": name, "etatas": etatas, "availability_raw": availability_raw})
         clear_generated_results(location)
