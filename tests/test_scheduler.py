@@ -64,9 +64,9 @@ class ScheduleRegressionTests(unittest.TestCase):
         settings = {"year": 2026, "month": 6, "full_time_hours": 160}
         demand = {day: (3.0 if day == 1 else 0.0) for day in range(1, 31)}
         workers = [
-            {"id": "a", "name": "Austeja", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
-            {"id": "b", "name": "Benas", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
-            {"id": "c", "name": "Lukas", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
+            {"id": "a", "name": "Worker A", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
+            {"id": "b", "name": "Worker B", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
+            {"id": "c", "name": "Worker C", "etatas": "1.0", "availability_raw": "\n".join(["galiu"] * 30)},
         ]
         runtime_workers = [
             app.build_worker_runtime(worker, settings, "location-g", demand)
@@ -85,12 +85,90 @@ class ScheduleRegressionTests(unittest.TestCase):
         self.assertEqual(app.etatas_to_month_hours("0.5", 168), 84)
         self.assertEqual(app.etatas_to_month_hours("0.75", 168), 126)
 
+    def test_turnaround_keeps_11h_hard_floor_and_prefers_13h_buffer(self):
+        prior_assignment = {1: {"start": 13 * 60, "end": 21 * 60 + 30}}
+
+        self.assertTrue(
+            app.would_break_rest_gap(prior_assignment, 2, "08:00", "16:30")
+        )
+        self.assertFalse(
+            app.would_break_rest_gap(prior_assignment, 2, "08:30", "17:00")
+        )
+        self.assertAlmostEqual(
+            app.get_soft_turnaround_penalty(
+                prior_assignment,
+                2,
+                "10:00",
+                "18:30",
+            ),
+            0.5,
+        )
+        self.assertEqual(
+            app.get_soft_turnaround_penalty(
+                prior_assignment,
+                2,
+                "13:00",
+                "21:30",
+            ),
+            0,
+        )
+
+    def test_adjacent_start_bonus_is_small_and_time_bounded(self):
+        prior_assignment = {1: {"start": 10 * 60, "end": 18 * 60 + 30}}
+
+        self.assertEqual(
+            app.get_adjacent_start_bonus(prior_assignment, 2, "11:00"),
+            app.ADJACENT_START_BONUS,
+        )
+        self.assertEqual(
+            app.get_adjacent_start_bonus(prior_assignment, 2, "11:30"),
+            0,
+        )
+
+    def test_generation_prefers_rested_opener_without_blocking_coverage(self):
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        demand = {
+            day: (2.0 if day == 1 else 1.0 if day == 2 else 0.0)
+            for day in range(1, 31)
+        }
+        workers = [
+            {
+                "id": "a",
+                "name": "Worker A",
+                "etatas": "1.0",
+                "availability_raw": "nuo 13\ngaliu",
+            },
+            {
+                "id": "b",
+                "name": "Worker B",
+                "etatas": "1.0",
+                "availability_raw": "galiu\ngaliu",
+            },
+        ]
+        runtime_workers = [
+            app.build_worker_runtime(worker, settings, "location-g", demand)
+            for worker in workers
+        ]
+
+        schedule, _ = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            "location-g",
+            demand,
+        )
+
+        self.assertEqual(
+            [item["worker_name"] for item in schedule[0]["assignments"]],
+            ["Worker B", "Worker A"],
+        )
+        self.assertEqual(schedule[1]["assignments"][0]["worker_name"], "Worker B")
+
     def test_worker_with_partial_availability_stays_in_summary(self):
         settings = {"year": 2026, "month": 6, "full_time_hours": 160}
         demand = {day: (1.0 if day == 1 else 0.0) for day in range(1, 31)}
         workers = [
-            {"id": "a", "name": "Lukas", "etatas": "0.5", "availability_raw": "galiu"},
-            {"id": "b", "name": "Benas", "etatas": "0.5", "availability_raw": "galiu"},
+            {"id": "a", "name": "Worker A", "etatas": "0.5", "availability_raw": "galiu"},
+            {"id": "b", "name": "Worker B", "etatas": "0.5", "availability_raw": "galiu"},
         ]
         runtime_workers = [
             app.build_worker_runtime(worker, settings, "location-d", demand)
@@ -99,7 +177,103 @@ class ScheduleRegressionTests(unittest.TestCase):
 
         _, summary = app.generate_month_schedule(runtime_workers, settings, "location-d", demand)
 
-        self.assertEqual({item["name"] for item in summary}, {"Lukas", "Benas"})
+        self.assertEqual({item["name"] for item in summary}, {"Worker A", "Worker B"})
+
+    def test_partial_schedule_completion_preserves_existing_assignment(self):
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        demand = {day: (2.0 if day == 1 else 0.0) for day in range(1, 31)}
+        workers = [
+            {"id": "a", "name": "Worker A", "etatas": "1.0", "availability_raw": "galiu"},
+            {"id": "b", "name": "Worker B", "etatas": "1.0", "availability_raw": "galiu"},
+        ]
+        runtime_workers = [
+            app.build_worker_runtime(worker, settings, "location-g", demand)
+            for worker in workers
+        ]
+        partial_schedule, _ = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            "location-g",
+            demand,
+            fill_open_slots=False,
+        )
+        partial_schedule[0]["assignments"][0].update(
+            {"worker_id": "a", "worker_name": "Worker A"}
+        )
+
+        completed_schedule, summary = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            "location-g",
+            demand,
+            existing_schedule=partial_schedule,
+        )
+
+        day_one = completed_schedule[0]
+        self.assertEqual(day_one["assignments"][0]["worker_name"], "Worker A")
+        self.assertEqual(day_one["assignments"][0]["worker_id"], "a")
+        self.assertEqual(day_one["assignments"][1]["worker_name"], "Worker B")
+        self.assertFalse(any(not item["worker_name"] for item in day_one["assignments"]))
+        self.assertEqual(sum(item["assigned_shifts"] for item in summary), 2)
+
+    def test_manual_assignment_is_preserved_when_availability_disagrees(self):
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        demand = {day: (1.0 if day == 1 else 0.0) for day in range(1, 31)}
+        workers = [
+            {"id": "a", "name": "Worker A", "etatas": "1.0", "availability_raw": "negaliu"},
+            {"id": "b", "name": "Worker B", "etatas": "1.0", "availability_raw": "galiu"},
+        ]
+        runtime_workers = [
+            app.build_worker_runtime(worker, settings, "location-g", demand)
+            for worker in workers
+        ]
+        partial_schedule = [{
+            "day": 1,
+            "assignments": [{
+                "shift_label": "Pilna 1",
+                "slot_kind": "Pilna",
+                "shift_time": "10:00-18:30",
+                "worker_id": "a",
+                "worker_name": "Worker A",
+            }],
+        }]
+
+        completed_schedule, _ = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            "location-g",
+            demand,
+            existing_schedule=partial_schedule,
+        )
+
+        self.assertEqual(completed_schedule[0]["assignments"][0]["worker_name"], "Worker A")
+        self.assertTrue(
+            any("Rankinis pasirinkimas neatitinka" in warning for warning in completed_schedule[0]["warnings"])
+        )
+
+    def test_schedule_form_uses_worker_ids_and_can_clear_a_slot(self):
+        schedule = [{
+            "day": 1,
+            "assignments": [
+                {"worker_id": None, "worker_name": None},
+                {"worker_id": "a", "worker_name": "Worker A"},
+            ],
+        }]
+        workers = [
+            {"id": "a", "name": "Worker A"},
+            {"id": "b", "name": "Worker B"},
+        ]
+
+        updated = app.apply_schedule_form_assignments(
+            schedule,
+            workers,
+            {"assignment_1_0": "b", "assignment_1_1": ""},
+        )
+
+        self.assertEqual(updated[0]["assignments"][0]["worker_name"], "Worker B")
+        self.assertEqual(updated[0]["assignments"][0]["worker_id"], "b")
+        self.assertIsNone(updated[0]["assignments"][1]["worker_name"])
+        self.assertEqual(schedule[0]["assignments"][0]["worker_name"], None)
 
 
 class WorkerEditingTests(unittest.TestCase):
@@ -136,6 +310,71 @@ class WorkerEditingTests(unittest.TestCase):
         self.assertEqual(self.location["generated_schedule"], [])
 
 
+class PartialScheduleRouteTests(unittest.TestCase):
+    def setUp(self):
+        self.location = app.app_data["locations"]["location-a"]
+        self.original_location = deepcopy(self.location)
+        settings = {"year": 2026, "month": 6, "full_time_hours": 160}
+        demand_values = ["2"] + ["0"] * 29
+        workers = [
+            {"id": "a", "name": "Worker A", "etatas": "1.0", "availability_raw": "galiu"},
+            {"id": "b", "name": "Worker B", "etatas": "1.0", "availability_raw": "galiu"},
+        ]
+        self.location.update({
+            "schedule_settings": settings,
+            "demand_raw": "\n".join(demand_values),
+            "workers": workers,
+            "worker_summary": None,
+            "schedule_insights": None,
+        })
+        demand, _ = app.get_demand_context(self.location, "location-a")
+        runtime_workers = [
+            app.build_worker_runtime(worker, settings, "location-a", demand)
+            for worker in workers
+        ]
+        self.location["generated_schedule"], _ = app.generate_month_schedule(
+            runtime_workers,
+            settings,
+            "location-a",
+            demand,
+            fill_open_slots=False,
+        )
+
+    def tearDown(self):
+        self.location.clear()
+        self.location.update(self.original_location)
+
+    def test_complete_route_saves_form_selection_and_fills_only_blanks(self):
+        client = app.app.test_client()
+
+        with patch.object(app, "save_app_data"), patch.object(
+            app,
+            "build_schedule_insights",
+            return_value={"items": [], "ai_used": False, "ai_status": ""},
+        ):
+            response = client.post(
+                "/complete_schedule",
+                data={"location_id": "location-a", "assignment_1_0": "a"},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        day_one = self.location["generated_schedule"][0]
+        self.assertEqual(day_one["assignments"][0]["worker_name"], "Worker A")
+        self.assertEqual(day_one["assignments"][1]["worker_name"], "Worker B")
+        self.assertEqual(response.headers["Location"], "/?location=location-a#schedule")
+
+    def test_partial_schedule_editor_renders_worker_selects_and_actions(self):
+        client = app.app.test_client()
+
+        response = client.get("/?location=location-a")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('name="assignment_1_0"', html)
+        self.assertIn("Išsaugoti dalį", html)
+        self.assertIn("Užbaigti grafiką", html)
+
+
 class WorkbookExportTests(unittest.TestCase):
     def test_compact_schedule_export_matches_manager_view(self):
         settings = {"year": 2026, "month": 6, "full_time_hours": 160}
@@ -145,8 +384,8 @@ class WorkbookExportTests(unittest.TestCase):
                 "weekday_name": "Pn",
                 "demand_label": "5",
                 "assignments": [
-                    {"slot_kind": "Pilna", "shift_time": "10:00-17:00", "worker_name": "Deividas"},
-                    {"slot_kind": "Pilna", "shift_time": "13:00-21:30", "worker_name": "Liepa"},
+                    {"slot_kind": "Pilna", "shift_time": "10:00-17:00", "worker_name": "Worker A"},
+                    {"slot_kind": "Pilna", "shift_time": "13:00-21:30", "worker_name": "Worker B"},
                 ],
                 "warnings": [],
             },
@@ -155,7 +394,7 @@ class WorkbookExportTests(unittest.TestCase):
                 "weekday_name": "St",
                 "demand_label": "3",
                 "assignments": [
-                    {"slot_kind": "Pilna", "shift_time": "10:00-16:00", "worker_name": "Liepa"},
+                    {"slot_kind": "Pilna", "shift_time": "10:00-16:00", "worker_name": "Worker B"},
                     {"slot_kind": "Pilna", "shift_time": "13:30-21:30", "worker_name": None},
                 ],
                 "warnings": ["Nera darbuotojo Pilna 2"],
@@ -168,7 +407,7 @@ class WorkbookExportTests(unittest.TestCase):
             generated_schedule,
             [
                 {
-                    "name": "Deividas",
+                    "name": "Worker A",
                     "etatas": "0.75",
                     "assigned_shifts": 1,
                     "assigned_hours": 7,
@@ -184,9 +423,9 @@ class WorkbookExportTests(unittest.TestCase):
         self.assertEqual(sheet["A1"].value, "5")
         self.assertEqual(sheet["B1"].value, "P")
         self.assertEqual(sheet["C1"].value, "birželio 12")
-        self.assertEqual(sheet["D1"].value, "Deividas 10:00-17:00")
-        self.assertEqual(sheet["E1"].value, "Liepa 13:00-21:30")
-        self.assertEqual(sheet["D1"].fill.fgColor.rgb, "00F5A623")
+        self.assertEqual(sheet["D1"].value, "Worker A 10:00-17:00")
+        self.assertEqual(sheet["E1"].value, "Worker B 13:00-21:30")
+        self.assertEqual(sheet["D1"].fill.fgColor.rgb, "009FC5E8")
         self.assertEqual(sheet["E2"].value, "13:30-21:30")
         self.assertEqual(sheet["E2"].fill.fgColor.rgb, "00B00000")
         self.assertIn("Ispejimai", workbook.sheetnames)

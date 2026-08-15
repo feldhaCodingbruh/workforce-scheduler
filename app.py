@@ -24,14 +24,19 @@ EXPORTS_DIR = Path(__file__).with_name("exports")
 DEFAULT_MONTH = 3
 DEFAULT_YEAR = 2026
 DEFAULT_FULL_TIME_HOURS = 160
-RULES_VERSION = 5
-BUILD_NUMBER = "0.4.4"
+RULES_VERSION = 6
+BUILD_NUMBER = "0.6.0"
 DEFAULT_AI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")
 FULL_SHIFT_MIN_HOURS = 7.0
 HALF_SHIFT_HOURS = 4.0
 MIN_SHORT_SHIFT_MINUTES = 270
 MIN_REST_HOURS = 11
 MAX_CONSECUTIVE_DAYS = 5
+# Conservative soft preferences calibrated from anonymized schedule history.
+PREFERRED_REST_HOURS = 13
+SOFT_TURNAROUND_PENALTY_PER_HOUR = 1.0
+ADJACENT_START_TOLERANCE_MINUTES = 60
+ADJACENT_START_BONUS = 0.15
 
 LOCATION_CONFIGS = [
     {"id": "location-a", "name": "Location A"},
@@ -762,6 +767,34 @@ def would_break_rest_gap(assignments_by_day, day, assigned_start, assigned_end, 
     return False
 
 
+def get_soft_turnaround_penalty(assignments_by_day, day, assigned_start, assigned_end, preferred_rest_hours=PREFERRED_REST_HOURS):
+    start_min, end_min = time_to_minutes(assigned_start), time_to_minutes(assigned_end)
+    preferred_minutes = preferred_rest_hours * 60
+    penalty = 0.0
+
+    previous_day_assignment = assignments_by_day.get(day - 1)
+    if previous_day_assignment:
+        previous_gap = (24 * 60 - previous_day_assignment["end"]) + start_min
+        penalty += max(0, preferred_minutes - previous_gap) / 60
+
+    next_day_assignment = assignments_by_day.get(day + 1)
+    if next_day_assignment:
+        next_gap = (24 * 60 - end_min) + next_day_assignment["start"]
+        penalty += max(0, preferred_minutes - next_gap) / 60
+
+    return penalty * SOFT_TURNAROUND_PENALTY_PER_HOUR
+
+
+def get_adjacent_start_bonus(assignments_by_day, day, assigned_start):
+    start_min = time_to_minutes(assigned_start)
+    matches = 0
+    for adjacent_day in (day - 1, day + 1):
+        adjacent_assignment = assignments_by_day.get(adjacent_day)
+        if adjacent_assignment and abs(adjacent_assignment["start"] - start_min) <= ADJACENT_START_TOLERANCE_MINUTES:
+            matches += 1
+    return matches * ADJACENT_START_BONUS
+
+
 def get_processing_day_order(year, month, demand_map):
     def sort_key(day):
         day_type, _ = get_day_type(year, month, day)
@@ -781,6 +814,18 @@ def is_closing_assignment(assigned_end, closing_end_minutes):
 def assignment_time_to_minutes(shift_time):
     start_str, end_str = shift_time.split("-")
     return time_to_minutes(start_str), time_to_minutes(end_str)
+
+
+def parse_assignment_interval(shift_time):
+    match = re.fullmatch(r"\s*(\d{2}:\d{2})\s*-\s*(\d{2}:\d{2})\s*", str(shift_time or ""))
+    if not match:
+        return None
+    start_time, end_time = match.groups()
+    if not is_valid_time(start_time) or not is_valid_time(end_time):
+        return None
+    if time_to_minutes(start_time) >= time_to_minutes(end_time):
+        return None
+    return start_time, end_time
 
 
 def can_cover_interval(parsed_day, start_time, end_time):
@@ -808,16 +853,16 @@ def repair_gap_with_availability(assignments, worker_day_map):
         gap_end = minutes_to_time(next_start)
 
         current_day = worker_day_map.get(current["worker_index"])
-        if current_day and can_cover_interval(current_day, minutes_to_time(current_start), gap_end):
+        if not current.get("locked") and current_day and can_cover_interval(current_day, minutes_to_time(current_start), gap_end):
             current["shift_time"] = f"{minutes_to_time(current_start)}-{gap_end}"
             return True, f"Tarpas uzdengtas prailginant {current['worker_name']} pamaina iki {gap_end} (sulauzo bazini sablona)."
 
         following_day = worker_day_map.get(following["worker_index"])
-        if following_day and can_cover_interval(following_day, gap_start, minutes_to_time(next_end)):
+        if not following.get("locked") and following_day and can_cover_interval(following_day, gap_start, minutes_to_time(next_end)):
             following["shift_time"] = f"{gap_start}-{minutes_to_time(next_end)}"
             return True, f"Tarpas uzdengtas paankstinant {following['worker_name']} pamaina nuo {gap_start} (sulauzo bazini sablona)."
 
-        if current_day and following_day:
+        if not current.get("locked") and not following.get("locked") and current_day and following_day:
             for bridge_minute in range(current_end + 30, next_start + 1, 30):
                 bridge_time = minutes_to_time(bridge_minute)
                 current_can_extend = can_cover_interval(
@@ -854,7 +899,7 @@ def sort_workers_for_display(worker_list):
     return sorted(worker_list, key=lambda worker: (-safe_float(worker["etatas"]), worker["name"].lower()))
 
 
-def get_shift_priority_score(worker_index, parsed_day, fit_info, shift, projected_hours, target_hours, assigned_hours, assigned_counts, weekend_counts, closing_counts, day_type, is_closing):
+def get_shift_priority_score(worker_index, parsed_day, fit_info, shift, projected_hours, target_hours, assigned_hours, assigned_counts, weekend_counts, closing_counts, day_type, is_closing, turnaround_penalty=0.0, adjacent_start_bonus=0.0):
     score = assigned_hours[worker_index] - target_hours
     if shift["role"] == "full" and parsed_day.get("preference") == "morning" and shift["start"] <= "11:00":
         score -= 0.25
@@ -869,6 +914,8 @@ def get_shift_priority_score(worker_index, parsed_day, fit_info, shift, projecte
     if is_closing:
         score += closing_counts[worker_index] * 0.8
     score += assigned_counts[worker_index] * 0.05
+    score += turnaround_penalty
+    score -= adjacent_start_bonus
     return score
 
 
@@ -904,7 +951,175 @@ def summarize_rejection_reasons(reason_counts):
     return f"{best_reason} ({best_count})"
 
 
-def generate_month_schedule(worker_list, schedule_settings, location_id, demand_map):
+def append_unique_warning(day_record, warning):
+    if warning not in day_record["warnings"]:
+        day_record["warnings"].append(warning)
+
+
+def build_existing_schedule_map(existing_schedule, days_in_month):
+    existing_by_day = {}
+    for raw_day in existing_schedule if isinstance(existing_schedule, list) else []:
+        if not isinstance(raw_day, dict):
+            continue
+        day = sanitize_int(raw_day.get("day"), 0, 1, days_in_month)
+        if day:
+            existing_by_day[day] = raw_day
+    return existing_by_day
+
+
+def build_schedule_blueprint(existing_schedule, schedule_settings, location_id, demand_map):
+    year, month = schedule_settings["year"], schedule_settings["month"]
+    days_in_month = get_days_in_month(year, month)
+    existing_by_day = build_existing_schedule_map(existing_schedule, days_in_month)
+    day_records = {}
+
+    for day in range(1, days_in_month + 1):
+        day_type, weekday_index = get_day_type(year, month, day)
+        shifts, day_warnings = build_requested_shifts(location_id, year, month, day, demand_map[day])
+        existing_day = existing_by_day.get(day, {})
+        existing_assignments = existing_day.get("assignments", []) if isinstance(existing_day.get("assignments"), list) else []
+        assignments = []
+        day_record = {
+            "day": day,
+            "weekday_name": weekday_name_from_index(weekday_index),
+            "day_type": day_type,
+            "demand_value": demand_map[day],
+            "demand_label": format_demand_value(demand_map[day]),
+            "requested_hours": int(demand_map[day] * 8),
+            "assignments": assignments,
+            "warnings": list(day_warnings),
+            "closing_end_minutes": get_day_closing_end_minutes(shifts),
+        }
+
+        for shift_index, shift in enumerate(shifts):
+            existing_assignment = existing_assignments[shift_index] if shift_index < len(existing_assignments) and isinstance(existing_assignments[shift_index], dict) else {}
+            interval = parse_assignment_interval(existing_assignment.get("shift_time"))
+            if not interval:
+                interval = shift["start"], shift["end"]
+                if existing_assignment.get("worker_name") or existing_assignment.get("worker_id"):
+                    append_unique_warning(day_record, f"Rankines pamainos {shift['label']} laikas buvo netinkamas; paliktas sablono laikas.")
+            worker_name = str(existing_assignment.get("worker_name") or "").strip() or None
+            worker_id = str(existing_assignment.get("worker_id") or "").strip() or None
+            assignments.append({
+                "shift_label": str(existing_assignment.get("shift_label") or shift["label"]),
+                "slot_kind": str(existing_assignment.get("slot_kind") or shift["slot_kind"]),
+                "shift_time": f"{interval[0]}-{interval[1]}",
+                "worker_name": worker_name,
+                "worker_id": worker_id,
+                "worker_index": None,
+                "locked": bool(worker_name or worker_id),
+                "template_shift": shift,
+            })
+
+        for extra_index, existing_assignment in enumerate(existing_assignments[len(shifts):], start=len(shifts) + 1):
+            if not isinstance(existing_assignment, dict):
+                continue
+            worker_name = str(existing_assignment.get("worker_name") or "").strip() or None
+            worker_id = str(existing_assignment.get("worker_id") or "").strip() or None
+            if not worker_name and not worker_id:
+                continue
+            interval = parse_assignment_interval(existing_assignment.get("shift_time"))
+            if not interval:
+                append_unique_warning(day_record, f"Papildoma rankine pamaina {extra_index} praleista, nes jos laikas netinkamas.")
+                continue
+            hours = shift_length_hours(interval[0], interval[1])
+            extra_shift = {
+                "label": str(existing_assignment.get("shift_label") or f"Rankine {extra_index}"),
+                "slot_kind": str(existing_assignment.get("slot_kind") or "Rankine"),
+                "start": interval[0],
+                "end": interval[1],
+                "hours": hours,
+                "role": "full" if hours >= FULL_SHIFT_MIN_HOURS else "half",
+            }
+            assignments.append({
+                "shift_label": extra_shift["label"],
+                "slot_kind": extra_shift["slot_kind"],
+                "shift_time": f"{interval[0]}-{interval[1]}",
+                "worker_name": worker_name,
+                "worker_id": worker_id,
+                "worker_index": None,
+                "locked": True,
+                "template_shift": extra_shift,
+            })
+            append_unique_warning(day_record, "Palikta papildoma rankine pamaina uz poreikio sablono ribu.")
+
+        assignment_ends = [
+            time_to_minutes(interval[1])
+            for assignment in assignments
+            if (interval := parse_assignment_interval(assignment["shift_time"]))
+        ]
+        if assignment_ends:
+            day_record["closing_end_minutes"] = max(day_record["closing_end_minutes"] or 0, max(assignment_ends))
+        if demand_map[day] == 0:
+            append_unique_warning(day_record, "Lokacija nedirba")
+        day_records[day] = day_record
+
+    return day_records
+
+
+def build_worker_assignment_lookup(valid_workers):
+    workers_by_id = {str(worker.get("id")): index for index, worker in enumerate(valid_workers) if worker.get("id")}
+    workers_by_name = {}
+    for index, worker in enumerate(valid_workers):
+        workers_by_name.setdefault(normalize_text(worker["name"]), []).append(index)
+    return workers_by_id, workers_by_name
+
+
+def resolve_assignment_worker_index(assignment, workers_by_id, workers_by_name):
+    worker_id = str(assignment.get("worker_id") or "").strip()
+    if worker_id and worker_id in workers_by_id:
+        return workers_by_id[worker_id]
+    worker_name = normalize_text(assignment.get("worker_name"))
+    matches = workers_by_name.get(worker_name, []) if worker_name else []
+    return matches[0] if len(matches) == 1 else None
+
+
+def register_assignment_state(worker_index, day, day_type, assignment, closing_end_minutes, assigned_counts, assigned_hours, assigned_days, weekend_counts, closing_counts, assignments_by_worker_day):
+    start_time, end_time = parse_assignment_interval(assignment["shift_time"])
+    template_shift = assignment["template_shift"]
+    if start_time == template_shift["start"] and end_time == template_shift["end"]:
+        shift_hours = template_shift.get("hours", shift_length_hours(start_time, end_time))
+    else:
+        shift_hours = shift_length_hours(start_time, end_time)
+
+    assigned_counts[worker_index] += 1
+    assigned_hours[worker_index] += shift_hours
+    assigned_days[worker_index].add(day)
+    if day_type == "weekend":
+        weekend_counts[worker_index] += 1
+    if is_closing_assignment(end_time, closing_end_minutes):
+        closing_counts[worker_index] += 1
+
+    start_minutes, end_minutes = time_to_minutes(start_time), time_to_minutes(end_time)
+    existing_window = assignments_by_worker_day[worker_index].get(day)
+    if existing_window:
+        existing_window["start"] = min(existing_window["start"], start_minutes)
+        existing_window["end"] = max(existing_window["end"], end_minutes)
+    else:
+        assignments_by_worker_day[worker_index][day] = {"start": start_minutes, "end": end_minutes}
+
+
+def add_locked_assignment_warnings(day_records, valid_workers, assignments_by_worker_day, assigned_days):
+    for worker_index, worker in enumerate(valid_workers):
+        prior_day = None
+        streak = 0
+        for day in sorted(assigned_days[worker_index]):
+            streak = streak + 1 if prior_day is not None and day == prior_day + 1 else 1
+            if streak > MAX_CONSECUTIVE_DAYS:
+                append_unique_warning(day_records[day], f"Rankinis pasirinkimas: {worker['name']} dirba daugiau nei {MAX_CONSECUTIVE_DAYS} dienas is eiles.")
+            prior_day = day
+
+        worker_days = assignments_by_worker_day[worker_index]
+        for day in sorted(worker_days):
+            previous = worker_days.get(day - 1)
+            if not previous:
+                continue
+            rest_minutes = (24 * 60 - previous["end"]) + worker_days[day]["start"]
+            if rest_minutes < MIN_REST_HOURS * 60:
+                append_unique_warning(day_records[day], f"Rankinis pasirinkimas: {worker['name']} turi maziau nei {MIN_REST_HOURS} val. poilsio.")
+
+
+def generate_month_schedule(worker_list, schedule_settings, location_id, demand_map, existing_schedule=None, fill_open_slots=True):
     year, month = schedule_settings["year"], schedule_settings["month"]
     valid_workers = sort_workers_for_display(worker_list[:])
     targets = calculate_targets(valid_workers, schedule_settings["full_time_hours"])
@@ -914,21 +1129,62 @@ def generate_month_schedule(worker_list, schedule_settings, location_id, demand_
     weekend_counts = {index: 0 for index in range(len(valid_workers))}
     closing_counts = {index: 0 for index in range(len(valid_workers))}
     assignments_by_worker_day = {index: {} for index in range(len(valid_workers))}
-    day_records_by_day = {}
+    workers_by_id, workers_by_name = build_worker_assignment_lookup(valid_workers)
+    day_records_by_day = build_schedule_blueprint(existing_schedule, schedule_settings, location_id, demand_map)
+
+    for day, day_record in day_records_by_day.items():
+        seen_workers = set()
+        for assignment in day_record["assignments"]:
+            if not assignment["locked"]:
+                continue
+            worker_index = resolve_assignment_worker_index(assignment, workers_by_id, workers_by_name)
+            assignment["worker_index"] = worker_index
+            if worker_index is None:
+                append_unique_warning(day_record, f"Rankine pamaina palikta, bet darbuotojas nerastas: {assignment['worker_name'] or assignment['worker_id']}.")
+                continue
+            worker = valid_workers[worker_index]
+            assignment["worker_id"] = worker.get("id")
+            assignment["worker_name"] = worker["name"]
+            if worker_index in seen_workers:
+                append_unique_warning(day_record, f"Rankinis pasirinkimas: {worker['name']} turi daugiau nei viena pamaina ta pacia diena.")
+            seen_workers.add(worker_index)
+            parsed_day = worker["parsed_availability"][day - 1]
+            start_time, end_time = parse_assignment_interval(assignment["shift_time"])
+            if not can_cover_interval(parsed_day, start_time, end_time):
+                append_unique_warning(day_record, f"Rankinis pasirinkimas neatitinka {worker['name']} galimybiu ({start_time}-{end_time}).")
+            register_assignment_state(
+                worker_index,
+                day,
+                day_record["day_type"],
+                assignment,
+                day_record["closing_end_minutes"],
+                assigned_counts,
+                assigned_hours,
+                assigned_days,
+                weekend_counts,
+                closing_counts,
+                assignments_by_worker_day,
+            )
+
+    add_locked_assignment_warnings(day_records_by_day, valid_workers, assignments_by_worker_day, assigned_days)
+
     for day in get_processing_day_order(year, month, demand_map):
-        day_type, weekday_index = get_day_type(year, month, day)
-        shifts, day_warnings = build_requested_shifts(location_id, year, month, day, demand_map[day])
-        closing_end_minutes = get_day_closing_end_minutes(shifts)
-        assignments_for_day, assigned_today = [], set()
-        assigned_worker_days = {}
-        day_record = {"day": day, "weekday_name": weekday_name_from_index(weekday_index), "day_type": day_type, "demand_value": demand_map[day], "demand_label": format_demand_value(demand_map[day]), "requested_hours": int(demand_map[day] * 8), "assignments": [], "warnings": list(day_warnings)}
+        day_record = day_records_by_day[day]
+        assignments_for_day = day_record["assignments"]
+        assigned_today = {assignment["worker_index"] for assignment in assignments_for_day if assignment["locked"] and assignment["worker_index"] is not None}
+        assigned_worker_days = {
+            assignment["worker_index"]: valid_workers[assignment["worker_index"]]["parsed_availability"][day - 1]
+            for assignment in assignments_for_day
+            if assignment["worker_index"] is not None
+        }
 
-        if demand_map[day] == 0:
-            day_record["warnings"].append("Lokacija nedirba")
-            day_records_by_day[day] = day_record
-            continue
+        for assignment in assignments_for_day:
+            if assignment["locked"]:
+                continue
+            shift = assignment["template_shift"]
+            if not fill_open_slots:
+                continue
 
-        for shift_index, shift in enumerate(shifts):
             candidates = []
             rejection_reasons = {}
             for worker_index, worker in enumerate(valid_workers):
@@ -936,10 +1192,7 @@ def generate_month_schedule(worker_list, schedule_settings, location_id, demand_
                     rejection_reasons["jau priskirtas kita pamaina ta diena"] = rejection_reasons.get("jau priskirtas kita pamaina ta diena", 0) + 1
                     continue
                 parsed_day = worker["parsed_availability"][day - 1]
-                if shift_index >= len(parsed_day["shift_fit"]):
-                    rejection_reasons["nera ivestu galimybiu tai dienai"] = rejection_reasons.get("nera ivestu galimybiu tai dienai", 0) + 1
-                    continue
-                fit_info = parsed_day["shift_fit"][shift_index]
+                fit_info = check_one_shift_fit(parsed_day, shift["start"], shift["end"])
                 if not fit_info["ok"]:
                     rejection_reasons["negali dirbti sios pamainos"] = rejection_reasons.get("negali dirbti sios pamainos", 0) + 1
                     continue
@@ -954,11 +1207,15 @@ def generate_month_schedule(worker_list, schedule_settings, location_id, demand_
                 if projected_hours > targets[worker_index] + 24:
                     rejection_reasons["virsytu valandu limita"] = rejection_reasons.get("virsytu valandu limita", 0) + 1
                     continue
-                is_closing = is_closing_assignment(fit_info["assigned_end"], closing_end_minutes)
+                is_closing = is_closing_assignment(fit_info["assigned_end"], day_record["closing_end_minutes"])
                 if blocks_closing_shift(parsed_day, is_closing):
                     rejection_reasons["ryto pageidavimas blokuoja uzdaryma"] = rejection_reasons.get("ryto pageidavimas blokuoja uzdaryma", 0) + 1
                     continue
-                candidates.append((get_shift_priority_score(worker_index, parsed_day, fit_info, shift, projected_hours, targets[worker_index], assigned_hours, assigned_counts, weekend_counts, closing_counts, day_type, is_closing), assigned_counts[worker_index], worker_index, worker["name"], fit_info, shift_hours, is_closing))
+                turnaround_penalty = get_soft_turnaround_penalty(assignments_by_worker_day[worker_index], day, fit_info["assigned_start"], fit_info["assigned_end"])
+                adjacent_start_bonus = get_adjacent_start_bonus(assignments_by_worker_day[worker_index], day, fit_info["assigned_start"])
+                score = get_shift_priority_score(worker_index, parsed_day, fit_info, shift, projected_hours, targets[worker_index], assigned_hours, assigned_counts, weekend_counts, closing_counts, day_record["day_type"], is_closing, turnaround_penalty, adjacent_start_bonus)
+                candidates.append((score, assigned_counts[worker_index], worker_index, worker["name"], fit_info, shift_hours, is_closing))
+
             candidates.sort(key=lambda item: (item[0], item[1], item[3].lower()))
             if candidates:
                 _, _, chosen_index, chosen_name, chosen_fit, chosen_shift_hours, chosen_is_closing = candidates[0]
@@ -966,27 +1223,43 @@ def generate_month_schedule(worker_list, schedule_settings, location_id, demand_
                 assigned_counts[chosen_index] += 1
                 assigned_hours[chosen_index] += chosen_shift_hours
                 assigned_days[chosen_index].add(day)
-                if day_type == "weekend":
+                if day_record["day_type"] == "weekend":
                     weekend_counts[chosen_index] += 1
                 if chosen_is_closing:
                     closing_counts[chosen_index] += 1
                 assignments_by_worker_day[chosen_index][day] = {"start": time_to_minutes(chosen_fit["assigned_start"]), "end": time_to_minutes(chosen_fit["assigned_end"])}
                 assigned_worker_days[chosen_index] = valid_workers[chosen_index]["parsed_availability"][day - 1]
-                assignments_for_day.append({"shift_label": shift["label"], "slot_kind": shift["slot_kind"], "shift_time": f"{chosen_fit['assigned_start']}-{chosen_fit['assigned_end']}", "worker_name": chosen_name, "worker_index": chosen_index})
+                assignment.update({
+                    "shift_time": f"{chosen_fit['assigned_start']}-{chosen_fit['assigned_end']}",
+                    "worker_name": chosen_name,
+                    "worker_id": valid_workers[chosen_index].get("id"),
+                    "worker_index": chosen_index,
+                })
             else:
-                assignments_for_day.append({"shift_label": shift["label"], "slot_kind": shift["slot_kind"], "shift_time": f"{shift['start']}-{shift['end']}", "worker_name": None, "worker_index": None})
                 reason_text = summarize_rejection_reasons(rejection_reasons)
-                day_record["warnings"].append(f"Nera darbuotojo {shift['label']} ({shift['start']}-{shift['end']}) del: {reason_text}")
-        gap_repaired, gap_warning = repair_gap_with_availability(assignments_for_day, assigned_worker_days)
-        if gap_repaired and gap_warning:
-            day_record["warnings"].append(gap_warning)
-        day_record["assignments"] = assignments_for_day
-        if has_gap_between_assignments(day_record["assignments"]):
-            day_record["warnings"].append("Yra tarpas grafike - parduotuve liktu tuscia")
+                append_unique_warning(day_record, f"Nera darbuotojo {shift['label']} ({shift['start']}-{shift['end']}) del: {reason_text}")
+
+        if fill_open_slots:
+            gap_repaired, gap_warning = repair_gap_with_availability(assignments_for_day, assigned_worker_days)
+            if gap_repaired and gap_warning:
+                append_unique_warning(day_record, gap_warning)
+        else:
+            open_shift_count = sum(not assignment["worker_name"] for assignment in assignments_for_day)
+            if open_shift_count:
+                append_unique_warning(day_record, f"Nepriskirta pamainu: {open_shift_count}.")
+        if has_gap_between_assignments(assignments_for_day):
+            append_unique_warning(day_record, "Yra tarpas grafike - parduotuve liktu tuscia")
+
+    generated_schedule = []
+    for day in range(1, get_days_in_month(year, month) + 1):
+        day_record = day_records_by_day[day]
+        day_record.pop("closing_end_minutes", None)
         for assignment in day_record["assignments"]:
             assignment.pop("worker_index", None)
-        day_records_by_day[day] = day_record
-    generated_schedule = [day_records_by_day.get(day, {"day": day, "weekday_name": weekday_name_from_index(calendar.weekday(year, month, day)), "demand_label": format_demand_value(demand_map[day]), "assignments": [], "warnings": []}) for day in range(1, get_days_in_month(year, month) + 1)]
+            assignment.pop("locked", None)
+            assignment.pop("template_shift", None)
+        generated_schedule.append(day_record)
+
     worker_summary = [{"name": worker["name"], "etatas": worker["etatas"], "assigned_shifts": assigned_counts[index], "assigned_hours": round(assigned_hours[index], 1), "target_hours": round(targets[index], 1), "hours_difference": round(assigned_hours[index] - targets[index], 1), "weekend_days": weekend_counts[index], "closing_shifts": closing_counts[index]} for index, worker in enumerate(valid_workers)]
     worker_summary = sorted(worker_summary, key=lambda worker: (-safe_float(worker["etatas"]), worker["name"].lower()))
     return generated_schedule, worker_summary
@@ -1060,12 +1333,11 @@ EXCEL_MONTH_GENITIVE_NAMES = {
 }
 EXCEL_WEEKDAY_LETTERS = ["P", "A", "T", "K", "P", "Š", "S"]
 PREFERRED_WORKER_FILL_COLORS = {
-    "lukas": "8FE3EA",
-    "benas": "B7D7A8",
-    "liepa": "C9B6F2",
-    "deividas": "F5A623",
-    "goda": "F7D982",
-    "samanta": "F4B183",
+    "worker a": "9FC5E8",
+    "worker b": "B6D7A8",
+    "worker c": "FFE599",
+    "worker d": "D9D2E9",
+    "worker e": "F9CB9C",
 }
 FALLBACK_WORKER_FILL_COLORS = [
     "9FC5E8",
@@ -1365,6 +1637,45 @@ def build_dashboard_stats(location, workers, demand_rows):
     return stats
 
 
+def build_schedule_progress(generated_schedule):
+    assignments = [
+        assignment
+        for day in generated_schedule if isinstance(day, dict)
+        for assignment in day.get("assignments", []) if isinstance(assignment, dict)
+    ]
+    return {
+        "assigned": sum(bool(assignment.get("worker_name")) for assignment in assignments),
+        "total": len(assignments),
+    }
+
+
+def apply_schedule_form_assignments(generated_schedule, workers, form_data):
+    updated_schedule = deepcopy(generated_schedule)
+    workers_by_id = {str(worker.get("id")): worker for worker in workers if worker.get("id")}
+    for day_record in updated_schedule:
+        if not isinstance(day_record, dict):
+            continue
+        day = day_record.get("day")
+        assignments = day_record.get("assignments", [])
+        if not isinstance(assignments, list):
+            continue
+        for assignment_index, assignment in enumerate(assignments):
+            if not isinstance(assignment, dict):
+                continue
+            field_name = f"assignment_{day}_{assignment_index}"
+            if field_name not in form_data:
+                continue
+            worker_id = str(form_data.get(field_name) or "").strip()
+            worker = workers_by_id.get(worker_id)
+            if worker:
+                assignment["worker_id"] = worker_id
+                assignment["worker_name"] = worker["name"]
+            else:
+                assignment["worker_id"] = None
+                assignment["worker_name"] = None
+    return updated_schedule
+
+
 def render_home_page(location_id):
     location_id, location = get_location(location_id)
     settings = location["schedule_settings"]
@@ -1385,6 +1696,7 @@ def render_home_page(location_id):
         demand_rows=demand_rows,
         default_demand_raw=build_default_demand_raw(location_id, settings["year"], settings["month"]),
         dashboard_stats=build_dashboard_stats(location, workers, demand_rows),
+        schedule_progress=build_schedule_progress(location["generated_schedule"]),
         build_number=BUILD_NUMBER,
         generated_schedule=location["generated_schedule"],
         worker_summary=location["worker_summary"],
@@ -1521,12 +1833,53 @@ def generate_schedule_route():
     location_id, location = get_location(get_requested_location_id())
     demand_map, _ = get_demand_context(location, location_id)
     workers = build_workers_for_view(location, location_id)
-    generated_schedule, worker_summary = generate_month_schedule(workers, location["schedule_settings"], location_id, demand_map)
+    fill_open_slots = request.form.get("mode") != "draft"
+    generated_schedule, worker_summary = generate_month_schedule(
+        workers,
+        location["schedule_settings"],
+        location_id,
+        demand_map,
+        fill_open_slots=fill_open_slots,
+    )
     location["generated_schedule"] = generated_schedule
     location["worker_summary"] = worker_summary
     location["schedule_insights"] = build_schedule_insights(location, generated_schedule, worker_summary)
     save_app_data()
-    return redirect(url_for("home", location=location_id))
+    return redirect(url_for("home", location=location_id, _anchor="schedule"))
+
+
+def update_existing_schedule(location_id, location, fill_open_slots):
+    if not location["generated_schedule"]:
+        abort(400)
+    demand_map, _ = get_demand_context(location, location_id)
+    workers = build_workers_for_view(location, location_id)
+    edited_schedule = apply_schedule_form_assignments(location["generated_schedule"], workers, request.form)
+    generated_schedule, worker_summary = generate_month_schedule(
+        workers,
+        location["schedule_settings"],
+        location_id,
+        demand_map,
+        existing_schedule=edited_schedule,
+        fill_open_slots=fill_open_slots,
+    )
+    location["generated_schedule"] = generated_schedule
+    location["worker_summary"] = worker_summary
+    location["schedule_insights"] = build_schedule_insights(location, generated_schedule, worker_summary)
+    save_app_data()
+
+
+@app.route("/save_partial_schedule", methods=["POST"])
+def save_partial_schedule_route():
+    location_id, location = get_location(get_requested_location_id())
+    update_existing_schedule(location_id, location, fill_open_slots=False)
+    return redirect(url_for("home", location=location_id, _anchor="schedule"))
+
+
+@app.route("/complete_schedule", methods=["POST"])
+def complete_schedule_route():
+    location_id, location = get_location(get_requested_location_id())
+    update_existing_schedule(location_id, location, fill_open_slots=True)
+    return redirect(url_for("home", location=location_id, _anchor="schedule"))
 
 
 @app.route("/export_schedule")

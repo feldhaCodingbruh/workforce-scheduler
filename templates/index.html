@@ -112,8 +112,13 @@
         .warning-fixed { color: var(--info); font-weight:700; }
         .warning-closed { color: var(--muted); font-weight:700; }
         .schedule-table th, .schedule-table td { text-align:center; }
+        .schedule-table th:last-child, .schedule-table td:last-child { min-width:300px; text-align:left; }
         .weekday-cell { font-weight:700; white-space:nowrap; }
         .shift-slot { min-width:180px; }
+        .shift-worker-select { width:100%; min-width:160px; margin-top:8px; padding:9px 10px; }
+        .schedule-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-top:4px; }
+        .complete-btn { background:var(--info); }
+        .visually-hidden { position:absolute; width:1px; height:1px; padding:0; margin:-1px; overflow:hidden; clip:rect(0,0,0,0); white-space:nowrap; border:0; }
         .muted { color:#888; }
         .location-title { display:flex; flex-wrap:wrap; gap:10px; align-items:baseline; margin-bottom:8px; }
         .location-chip { display:inline-block; padding:6px 12px; border-radius:999px; background:#ececec; font-weight:600; }
@@ -243,7 +248,10 @@
         {% endif %}
         <form action="{{ url_for('generate_schedule_route') }}" method="POST">
             <input type="hidden" name="location_id" value="{{ current_location_id }}">
-            <button type="submit" class="generate-btn">Sugeneruoti grafika</button>
+            <div class="action-row">
+                <button type="submit" name="mode" value="generate" class="generate-btn">Sugeneruoti grafiką</button>
+                <button type="submit" name="mode" value="draft" class="secondary-btn">Sukurti tuščią ruošinį</button>
+            </div>
         </form>
     </div>
 
@@ -304,35 +312,55 @@
     <div class="box section-anchor" id="schedule">
         <div class="row spread">
             <h2>{{ current_location.name }} sugeneruotas grafikas</h2>
-            <a class="tab-link" href="{{ url_for('export_schedule', location=current_location_id) }}">Atsisiusti Excel</a>
+            <div class="action-row">
+                <span class="count-badge">Užpildyta {{ schedule_progress.assigned }} / {{ schedule_progress.total }}</span>
+                <a class="tab-link" href="{{ url_for('export_schedule', location=current_location_id) }}">Atsisiųsti Excel</a>
+            </div>
         </div>
-        <table class="schedule-table">
-            <thead><tr><th>Diena</th><th>Sav. d.</th><th>Poreikis</th><th class="shift-slot">Pamaina 1</th><th class="shift-slot">Pamaina 2</th><th class="shift-slot">Pamaina 3</th><th class="shift-slot">Pamaina 4</th><th class="shift-slot">Pamaina 5</th><th>Ispejimai</th></tr></thead>
-            <tbody>
-                {% for day in generated_schedule %}
-                <tr class="{% if day.warnings %}warning-row{% endif %}">
-                    <td>{{ day.day }}</td>
-                    <td class="weekday-cell">{{ day.weekday_name }}</td>
-                    <td><span class="count-badge">{{ day.demand_label }}</span></td>
-                    {% for assignment in day.assignments %}
-                        <td class="shift-slot"><strong>{{ assignment.slot_kind }}</strong><br>{{ assignment.shift_time }}<br>{% if assignment.worker_name %}{{ assignment.worker_name }}{% else %}<span class="muted">-</span>{% endif %}</td>
+        <form action="{{ url_for('save_partial_schedule_route') }}" method="POST">
+            <input type="hidden" name="location_id" value="{{ current_location_id }}">
+            <div class="schedule-actions">
+                <button type="submit" class="secondary-btn">Išsaugoti dalį</button>
+                <button type="submit" class="complete-btn" formaction="{{ url_for('complete_schedule_route') }}">Užbaigti grafiką</button>
+            </div>
+            <table class="schedule-table">
+                <thead><tr><th>Diena</th><th>Sav. d.</th><th>Poreikis</th><th class="shift-slot">Pamaina 1</th><th class="shift-slot">Pamaina 2</th><th class="shift-slot">Pamaina 3</th><th class="shift-slot">Pamaina 4</th><th class="shift-slot">Pamaina 5</th><th>Įspėjimai</th></tr></thead>
+                <tbody>
+                    {% for day in generated_schedule %}
+                    <tr class="{% if day.warnings %}warning-row{% endif %}">
+                        <td>{{ day.day }}</td>
+                        <td class="weekday-cell">{{ day.weekday_name }}</td>
+                        <td><span class="count-badge">{{ day.demand_label }}</span></td>
+                        {% for assignment in day.assignments %}
+                            <td class="shift-slot">
+                                <strong>{{ assignment.slot_kind }}</strong><br>
+                                {{ assignment.shift_time }}
+                                <label class="visually-hidden" for="assignment_{{ day.day }}_{{ loop.index0 }}">{{ day.day }} dienos {{ assignment.shift_label }} darbuotojas</label>
+                                <select class="shift-worker-select" id="assignment_{{ day.day }}_{{ loop.index0 }}" name="assignment_{{ day.day }}_{{ loop.index0 }}">
+                                    <option value="" {% if not assignment.worker_name and not assignment.worker_id %}selected{% endif %}>Nepriskirta</option>
+                                    {% for worker in workers %}
+                                        <option value="{{ worker.id }}" {% if assignment.worker_id == worker.id or (not assignment.worker_id and assignment.worker_name == worker.name) %}selected{% endif %}>{{ worker.name }}</option>
+                                    {% endfor %}
+                                </select>
+                            </td>
+                        {% endfor %}
+                        {% if day.assignments|length < 5 %}{% for _ in range(5 - day.assignments|length) %}<td class="shift-slot"><span class="muted">-</span></td>{% endfor %}{% endif %}
+                        <td>
+                            {% if day.warnings %}
+                                <ul class="warning-list">
+                                    {% for warning in day.warnings %}
+                                        <li class="{% if 'Tarpas uzdengtas' in warning %}warning-fixed{% elif 'Lokacija nedirba' in warning %}warning-closed{% elif 'Nera darbuotojo' in warning or 'Nepriskirta' in warning or 'tuscia' in warning or 'Rankinis pasirinkimas' in warning %}warning-critical{% endif %}">{{ warning }}</li>
+                                    {% endfor %}
+                                </ul>
+                            {% else %}
+                                Gerai
+                            {% endif %}
+                        </td>
+                    </tr>
                     {% endfor %}
-                    {% if day.assignments|length < 5 %}{% for _ in range(5 - day.assignments|length) %}<td class="shift-slot"><span class="muted">-</span></td>{% endfor %}{% endif %}
-                    <td>
-                        {% if day.warnings %}
-                            <ul class="warning-list">
-                                {% for warning in day.warnings %}
-                                    <li class="{% if 'Tarpas uzdengtas' in warning %}warning-fixed{% elif 'Lokacija nedirba' in warning %}warning-closed{% elif 'Nera darbuotojo' in warning or 'tuscia' in warning %}warning-critical{% endif %}">{{ warning }}</li>
-                                {% endfor %}
-                            </ul>
-                        {% else %}
-                            Gerai
-                        {% endif %}
-                    </td>
-                </tr>
-                {% endfor %}
-            </tbody>
-        </table>
+                </tbody>
+            </table>
+        </form>
     </div>
     {% endif %}
 

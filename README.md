@@ -22,6 +22,7 @@ adding repeatable scheduling rules and visible warnings.
 - Configurable month, full-time monthly hours, staffing demand, and employee FTE.
 - Full, partial, and template-override shifts when demand exceeds the base plan.
 - Coverage, minimum-rest, consecutive-day, and workload-balance checks.
+- Editable schedule drafts that preserve manual assignments and fill only open shifts.
 - Employee editing and incomplete-input warnings.
 - Compact Excel schedule export with warnings and employee summaries.
 - Optional OpenAI-assisted schedule suggestions when `OPENAI_API_KEY` is set.
@@ -45,6 +46,22 @@ flowchart LR
 
 The public repository uses generic locations and synthetic examples. Real
 employee inputs remain only in the ignored local `scheduler_data.json` file.
+
+## Privacy boundary
+
+This repository is the sanitized portfolio version. It contains only generic
+`Location A` through `Location I` configuration and `Worker A` style test data.
+Real employee names, availability, saved schedules, spreadsheet history,
+exports, and environment secrets belong only in the separate private workspace.
+
+Run the privacy gate before publishing:
+
+```powershell
+python scripts/privacy_check.py
+```
+
+The same check runs in GitHub Actions and rejects tracked operational data,
+spreadsheet files, private archive folders, local user paths, and secrets.
 
 ## Run locally
 
@@ -83,8 +100,9 @@ editing, and Excel export formatting.
 2. Set daily staffing demand.
 3. Add each employee and paste one availability line per calendar day.
 4. Resolve incomplete-input warnings or intentionally continue with partial data.
-5. Generate the schedule and review coverage and workload warnings.
-6. Export the manager-ready Excel workbook.
+5. Generate the schedule, or create an empty draft and assign part of it manually.
+6. Save the draft or complete only its open shifts, then review coverage and workload warnings.
+7. Export the manager-ready Excel workbook.
 
 ## Project status
 
