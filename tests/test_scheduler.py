@@ -409,6 +409,19 @@ class WorkerEditingTests(unittest.TestCase):
         self.assertEqual(self.location["workers"][0]["availability_raw"], "\n\ngaliu\n\nnegaliu\n")
         self.assertEqual(self.location["generated_schedule"], [])
 
+    def test_edit_page_initializes_edge_blank_days_without_html_newline_loss(self):
+        self.location["workers"] = [
+            {"id": "worker-1", "name": "Worker", "etatas": "0.5", "availability_raw": "\n\nGaliu\n"}
+        ]
+        client = app.app.test_client()
+
+        response = client.get("/worker/worker-1/edit?location=location-a")
+        html = response.get_data(as_text=True)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('<textarea id="availability" name="availability" spellcheck="false"></textarea>', html)
+        self.assertIn('document.getElementById("availability").value = "\\n\\nGaliu\\n";', html)
+
 
 class PartialScheduleRouteTests(unittest.TestCase):
     def setUp(self):

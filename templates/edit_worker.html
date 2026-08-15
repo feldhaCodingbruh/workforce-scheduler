@@ -54,7 +54,7 @@
 
             <label for="availability">Menesio galimumas</label>
             <div class="hint">Viena eilute = viena kalendorine diena. Vidines tuscios eilutes issaugomos ir nepastumia velesniu dienu.</div>
-            <textarea id="availability" name="availability" spellcheck="false">{{ worker.availability_raw }}</textarea>
+            <textarea id="availability" name="availability" spellcheck="false"></textarea>
 
             <div class="actions">
                 <button type="submit">Issaugoti pakeitimus</button>
@@ -65,6 +65,7 @@
     <div class="footer">Build {{ build_number }}</div>
 
     <script>
+        document.getElementById("availability").value = {{ worker.availability_raw | tojson }};
         const storedTheme = localStorage.getItem("theme");
         if (storedTheme) document.body.setAttribute("data-theme", storedTheme);
     </script>
